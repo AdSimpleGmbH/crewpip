@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+/**
+ * launchd-Dienst für den mngboard-Daemon (macOS, pro Benutzer).
+ *
+ *   node scripts/service.mjs install    schreibt ~/Library/LaunchAgents/at.ostheimer.mngboard.plist und startet
+ *   node scripts/service.mjs uninstall  stoppt und entfernt den Dienst
+ *   node scripts/service.mjs restart    startet neu (z. B. nach pnpm build)
+ *   node scripts/service.mjs status     zeigt launchd-Zustand und Health-Endpunkt
+ *
+ * KeepAlive sorgt dafür, dass launchd den Daemon nach einem Absturz neu startet; RunAtLoad
+ * startet ihn nach dem Login. Logs liegen unter ~/.mngboard/daemon.log.
+ */
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const LABEL = "at.ostheimer.mngboard";
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const entry = path.join(repoRoot, "apps/daemon/dist/index.js");
+const home = os.homedir();
+const plistPath = path.join(home, "Library/LaunchAgents", `${LABEL}.plist`);
+const dataDir = path.join(home, ".mngboard");
+const logPath = path.join(dataDir, "daemon.log");
+const port = process.env.MNGBOARD_PORT ?? "7357";
+const domain = `gui/${process.getuid()}`;
+
+/**
+ * Suchpfad des Dienstes. node liegt bei Homebrew unter .../Cellar/node/<version>/bin, dort
+ * stehen aber keine global installierten Programme wie `claude`. Ohne die üblichen
+ * bin-Verzeichnisse fände der Runner sie nicht.
+ */
+function servicePath() {
+  const dirs = [path.dirname(process.execPath), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  return [...new Set(dirs)].join(":");
+}
+
+function plist() {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${esc(process.execPath)}</string>
+    <string>${esc(entry)}</string>
+  </array>
+  <key>WorkingDirectory</key><string>${esc(repoRoot)}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MNGBOARD_PORT</key><string>${esc(port)}</string>
+    <key>MNGBOARD_DB</key><string>${esc(path.join(dataDir, "mngboard.db"))}</string>
+    <key>PATH</key><string>${esc(servicePath())}</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>${esc(logPath)}</string>
+  <key>StandardErrorPath</key><string>${esc(logPath)}</string>
+</dict>
+</plist>
+`;
+}
+
+function launchctl(...args) {
+  return spawnSync("launchctl", args, { encoding: "utf8" });
+}
+
+async function bootout() {
+  const r = launchctl("bootout", `${domain}/${LABEL}`);
+  // Exit 3 / "No such process": war nicht geladen, das ist in Ordnung.
+  if (r.status !== 0 && !/No such process|Could not find/i.test(r.stderr + r.stdout)) {
+    console.error(r.stderr.trim() || r.stdout.trim());
+  }
+  // Warten, bis der alte Prozess den Port freigegeben hat, sonst scheitert der Neustart am belegten Port.
+  for (let i = 0; i < 20 && (await health()); i++) await new Promise((res) => setTimeout(res, 250));
+}
+
+function bootstrap() {
+  const r = launchctl("bootstrap", domain, plistPath);
+  if (r.status !== 0) {
+    console.error(r.stderr.trim() || r.stdout.trim());
+    process.exit(1);
+  }
+}
+
+function token() {
+  if (process.env.MNGBOARD_TOKEN) return process.env.MNGBOARD_TOKEN.trim();
+  try {
+    return fs.readFileSync(process.env.MNGBOARD_TOKEN_FILE ?? path.join(dataDir, "token"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function health() {
+  try {
+    const t = token();
+    const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+      headers: t ? { "x-mngboard-token": t } : {},
+      signal: AbortSignal.timeout(2000),
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitHealthy(tries = 20) {
+  for (let i = 0; i < tries; i++) {
+    const h = await health();
+    if (h) return h;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return null;
+}
+
+async function main() {
+  const cmd = process.argv[2];
+  switch (cmd) {
+    case "install":
+    case "restart": {
+      if (!fs.existsSync(entry)) {
+        console.error(`Fehlt: ${entry}. Zuerst \`pnpm build\` ausführen.`);
+        process.exit(1);
+      }
+      fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+      fs.mkdirSync(dataDir, { recursive: true });
+      await bootout();
+      fs.writeFileSync(plistPath, plist());
+      bootstrap();
+      const h = await waitHealthy();
+      if (!h) {
+        console.error(`Dienst geladen, aber http://127.0.0.1:${port}/api/health antwortet nicht. Log: ${logPath}`);
+        process.exit(1);
+      }
+      console.log(`${cmd === "install" ? "Installiert" : "Neu gestartet"}: ${LABEL} auf http://127.0.0.1:${port} (Log: ${logPath})`);
+      break;
+    }
+    case "uninstall": {
+      await bootout();
+      if (fs.existsSync(plistPath)) fs.unlinkSync(plistPath);
+      console.log(`Entfernt: ${LABEL}. Datenbank bleibt unter ${dataDir}.`);
+      break;
+    }
+    case "status": {
+      const r = launchctl("print", `${domain}/${LABEL}`);
+      const loaded = r.status === 0;
+      const state = loaded ? (r.stdout.match(/state = (\w+)/)?.[1] ?? "unbekannt") : "nicht geladen";
+      const pid = loaded ? (r.stdout.match(/pid = (\d+)/)?.[1] ?? "-") : "-";
+      const h = await health();
+      console.log(`launchd: ${state}${pid !== "-" ? ` (pid ${pid})` : ""}  plist: ${fs.existsSync(plistPath) ? plistPath : "fehlt"}`);
+      console.log(`health:  ${h ? `ok, Version ${h.version}` : "keine Antwort"} auf http://127.0.0.1:${port}`);
+      process.exit(loaded && h ? 0 : 1);
+    }
+    default:
+      console.log("Verwendung: node scripts/service.mjs install|uninstall|restart|status");
+      process.exit(cmd ? 1 : 0);
+  }
+}
+
+main().catch((e) => {
+  console.error(e.message);
+  process.exit(1);
+});
