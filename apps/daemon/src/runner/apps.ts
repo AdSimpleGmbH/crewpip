@@ -103,6 +103,42 @@ function onPath(name: string): string | null {
 
 const now = () => new Date().toISOString();
 
+function executableFile(p: string): boolean {
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    return fs.statSync(p).isFile();
+  } catch { return false; }
+}
+
+function directories(p: string): string[] {
+  try {
+    return fs.readdirSync(p, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name);
+  } catch { return []; }
+}
+
+/** launchd does not inherit the user's shell PATH; desktop installs also move on updates. */
+function claudeBinary(): string | null {
+  const inPath = onPath("claude");
+  if (inPath && executableFile(inPath)) return inPath;
+  const home = process.env.HOME;
+  if (!home) return null;
+  const native = path.join(home, ".local/bin/claude");
+  if (executableFile(native)) return native;
+  const root = path.join(home, "Library/Application Support/Claude/claude-code");
+  const versions = directories(root).filter(v => /^\d+\.\d+\.\d+$/.test(v)).sort((a, b) => {
+    const av = a.split(".").map(Number), bv = b.split(".").map(Number);
+    return bv[0]! - av[0]! || bv[1]! - av[1]! || bv[2]! - av[2]!;
+  });
+  for (const version of versions) {
+    const base = path.join(root, version);
+    for (const dir of [base, ...directories(base).sort().map(d => path.join(base, d))]) {
+      const candidate = path.join(dir, "claude.app/Contents/MacOS/claude");
+      if (executableFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
 export const codexApp: RunnerApp = {
   id: "codex",
   promptVia: "argv",
@@ -157,9 +193,7 @@ export const codexApp: RunnerApp = {
 export const claudeApp: RunnerApp = {
   id: "claude",
   promptVia: "stdin",
-  bin: () =>
-    onPath("claude") ??
-    firstExisting(path.join(process.env.HOME ?? "", "Library/Application Support/Claude/claude-code/2.1.255/claude.app/Contents/MacOS/claude")),
+  bin: claudeBinary,
   args: ({ mode }) => [
     "-p",
     "--output-format",
@@ -199,8 +233,8 @@ export const claudeApp: RunnerApp = {
   },
   authProblem: (t) => /not logged in|please run \/login|invalid api key/i.test(t),
   loginHint:
-    "Die App-interne Anmeldung erreicht nur Sitzungen, die die App selbst startet. Für mngboard einmal `claude auth login` " +
-    "in einem Terminal ausführen; das eigenständige CLI liegt bereits unter /opt/homebrew/bin/claude.",
+    "Mit dem von mngboard gefundenen Claude-Programm `auth status` prüfen und bei Bedarf `auth login` ausführen. " +
+    "Die Anmeldung der Desktop-App allein belegt keine CLI-Anmeldung; vor einem Lauf auch die Abrechnungsart prüfen.",
   loggedIn: (bin) => {
     const out = ask(bin, ["auth", "status"]);
     if (out === null) return null;
