@@ -337,3 +337,9 @@ h2 { font-size:15px; line-height:1.4; margin:0; font-weight:650; }
 @media (max-width:700px) { .desktop-project { display:none; } .mobile-project { display:block; max-width:100%; font-size:12px; padding:7px; } }
 
 .run-head .run-toggle { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:0; padding:6px 0; background:transparent; border:0; flex:1; text-align:left; font-size:12px; }
+
+.setup-links { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-bottom: 20px; font-size: 14px; }
+.language-select { width: max-content; max-width: 100%; }
+@media (max-width: 700px) {
+  .sidebar-bottom { display: flex; align-items: center; gap: 10px; }
+}

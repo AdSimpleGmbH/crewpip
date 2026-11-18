@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "echo web has no tests yet"
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@mngboard/shared": "workspace:*",

@@ -5,11 +5,15 @@
  */
 const TOKEN: string = (window as unknown as { __MNGBOARD_TOKEN__?: string }).__MNGBOARD_TOKEN__ ?? "";
 
+export class ConnectionError extends Error {
+  constructor() { super("Verbindung fehlgeschlagen."); }
+}
+
 export function api(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (TOKEN) headers.set("x-mngboard-token", TOKEN);
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
-  return fetch(path, { ...init, headers });
+  return fetch(path, { ...init, headers }).catch(() => { throw new ConnectionError(); });
 }
 
 export function wsUrl(): string {
