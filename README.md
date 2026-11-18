@@ -1,4 +1,15 @@
-# mngboard
+# CrewPip
+
+Auf einem Mac mit Git, Node.js und pnpm installieren:
+
+```bash
+git clone https://github.com/ostheimer/crewpip.git
+cd crewpip
+pnpm install --frozen-lockfile
+pnpm service:install
+```
+
+Öffne anschließend http://127.0.0.1:7357 und verbinde die gewünschten Apps wie unter „Apps anbinden“ beschrieben. Bei einem Wechsel von mngboard verwendet CrewPip denselben lokalen Datenordner, Dienstnamen und MCP-Endpunkt. Bestehende Hook-Einträge können weiterhin auf den bisherigen Checkout verweisen.
 
 Nachrichtenzentrale für KI-Coding-Agents auf dem Mac. Chats in **Claude Code**, **Cursor** und
 **Codex** können sich gegenseitig Nachrichten hinterlassen und bekommen mit, wenn eine
