@@ -3,7 +3,7 @@ import { ArrowRight, CheckCheck, CircleHelp, Folder, LayoutDashboard, ListTodo, 
 import { APP_LABELS, ROLE_LABELS, SESSION_ROLES, type AppKind, type Message, type Project, type Run, type RunItem, type Session, type Task, type WsEvent } from "@mngboard/shared";
 import { LanguageProvider, recipientLabel, useBoardLanguage } from "./language.tsx";
 import { displayError } from "./errors.ts";
-import { api, wsUrl } from "./api.ts";
+import { api, ConnectionError, wsUrl } from "./api.ts";
 import { Tasks } from "./Tasks.tsx";
 import { Content } from "./Content.tsx";
 
@@ -22,6 +22,14 @@ function MessageCard({ message: m, onReply, expanded = false }: { message: Messa
     <footer><span>{m.pending.length ? ui.pendingChats(m.pending.length) : m.deliveries.length ? ui.delivered : ui.noReceipt}</span><button className="text-button" onClick={() => onReply(m)}>{ui.reply} <ArrowRight size={14} /></button></footer>
     {!!(m.deliveries.length || m.pending.length) && <details className="delivery-details"><summary>{ui.receipts}</summary>{m.deliveries.map(d => <p key={d.sessionId}>{d.sessionLabel}: {ui.delivery[d.method]} · {date(d.at, locale)}</p>)}{m.pending.map(p => <p key={p}>{p}{ui.waiting}</p>)}</details>}
   </article>;
+}
+
+function SetupLinks() {
+  const { ui } = useBoardLanguage();
+  return <div className="setup-links">
+    <a href={ui.connectUrl} target="_blank" rel="noopener noreferrer">{ui.connectChat}</a>
+    <a href={ui.deliveryUrl} target="_blank" rel="noopener noreferrer">{ui.firstDelivery}</a>
+  </div>;
 }
 
 export function App() {
@@ -65,7 +73,7 @@ function Board() {
         const urls = ["/api/messages", "/api/sessions", "/api/tasks?status=open,claimed,review,done,cancelled", "/api/projects", "/api/runs"];
         const [m, s, t, p, r] = await Promise.all(urls.map(async url => { const res = await api(url); if (!res.ok) throw new Error(`Daten konnten nicht geladen werden (${res.status}).`); return res.json(); }));
         if (!closed) { setMessages(m); setSessions(s); setTasks(t); setProjects(p); setRuns(r); setLoaded(true); }
-      } catch (e) { if (!closed) setError(`${e instanceof Error ? e.message : "Verbindung fehlgeschlagen"} Bitte die Seite neu laden.`); }
+      } catch (e) { if (!closed) setError(`${e instanceof Error ? e.message : "Verbindung fehlgeschlagen."} Bitte die Seite neu laden.`); }
     }
     const connect = () => {
       if (closed) return;
@@ -120,10 +128,10 @@ function Board() {
     if (sendLock.current || !text.trim()) return;
     sendLock.current = true; setSending(true); setError(null);
     try {
-      const res = await api("/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from: from.trim() || ui.human, to, text: text.trim() }) });
+      const res = await api("/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from: from.trim() || "Mensch", to, text: text.trim() }) });
       if (!res.ok) throw new Error((await res.json()).error ?? "Senden fehlgeschlagen");
       setText(""); setCompose(false); setNotice(true);
-    } catch (e) { setError(e instanceof Error ? e.message : "Senden fehlgeschlagen. Dein Text bleibt erhalten."); }
+    } catch (e) { setError(e instanceof Error && !(e instanceof ConnectionError) ? e.message : "Senden fehlgeschlagen. Dein Text bleibt erhalten."); }
     finally { setSending(false); sendLock.current = false; }
   }
   async function editSession(s: Session, data: object) {
@@ -171,6 +179,7 @@ function Board() {
           </div>
           <section className="orientation"><div className="orientation-icon"><Send size={22} /></div><div><h2>{ui.setDirection}</h2><p>{ui.directionIntro}</p><span>{ui.deliveryTiming}</span></div><button className="secondary" onClick={() => setView("guide")}>{ui.howItWorks} <ArrowRight size={15} /></button></section>
           {!directors.length && <div className="error-banner">{ui.noDirector}</div>}
+          {!sessions.length && <SetupLinks />}
           <div className="overview-columns"><section><div className="section-heading"><h2>{ui.upNext}</h2><button className="text-button" onClick={() => setView("tasks")}>{ui.allTasks} <ArrowRight size={15} /></button></div>
             <div className="next-list">{[...review, ...openTasks.filter(t => t.status !== "review")].slice(0, 4).map(t => <button key={t.id} className="next-task" onClick={() => { setProjectId(t.projectId); setView("tasks"); }}><span className={`status-tag ${t.status}`}>{ui.taskStatus[t.status]}</span><strong>{t.title}</strong><span>{t.projectName} · #{t.id}</span><ArrowRight size={17} /></button>)}{!openTasks.length && <div className="empty"><CheckCheck size={26} /><p>{ui.noOpenTasks}</p><small>{ui.noOpenTasksHint}</small></div>}</div>
           </section><section className="coordination"><div className="section-heading"><h2>{ui.coordination}</h2></div><div className="coordination-body"><div className="role-step"><b>{ui.you}</b><span>{ui.setGoal}</span></div><div className="flow-line">↓</div><div className="role-step"><b>Director</b><span>{directors.length ? ui.registered(directors.length) : ui.noChat}</span></div><div className="flow-line">↓</div><div className="role-step"><b>{ui.roleFlow}</b><span>{ui.workflow}</span></div><p>{ui.boardScope}</p></div></section></div>
@@ -179,7 +188,7 @@ function Board() {
         </>}
         {view === "tasks" && <><div className="page-heading"><div><p className="eyebrow">{ui.taskEyebrow}</p><h1>{ui.tasks}</h1><p>{ui.tasksIntro}</p></div></div><Tasks tasks={tasks} projects={projects} sessions={sessions} projectFilter={projectId} onError={setError} runs={runs} runApps={runApps} liveItems={liveItems} /></>}
         {view === "messages" && <><div className="page-heading"><div><p className="eyebrow">{ui.messageEyebrow}</p><h1>{ui.messages}</h1><p>{ui.messagesIntro}</p></div><button className="primary" onClick={() => write()}><Plus size={17} />{ui.compose}</button></div><div className="message-filters"><label className="search-field"><Search size={17} /><input value={search} onChange={e => setSearch(e.target.value)} aria-label={ui.searchMessages} placeholder={ui.messagePlaceholder} /></label><select aria-label={ui.filterMessages} value={messageScope} onChange={e => setMessageScope(e.target.value)}><option value="all">{ui.allMessages}</option><option value="director">{ui.toDirector}</option><option value="waiting">{ui.pendingDelivery}</option></select><span>{shown.length} {ui.messageCount}</span></div><div className="message-list">{shown.slice(0, 100).map(m => <MessageCard key={m.id} message={m} onReply={reply} />)}{shown.length > 100 && <p>{ui.latestHundred}</p>}{!shown.length && <div className="empty">{ui.noMessages}</div>}</div></>}
-        {view === "guide" && <><div className="page-heading"><div><p className="eyebrow">{ui.guideEyebrow}</p><h1>{ui.guideTitle}</h1><p>{ui.guideIntro}</p></div></div><div className="guide-grid">
+        {view === "guide" && <><div className="page-heading"><div><p className="eyebrow">{ui.guideEyebrow}</p><h1>{ui.guideTitle}</h1><p>{ui.guideIntro}</p></div></div><SetupLinks /><div className="guide-grid">
           <article><span className="step-number">1</span><h2>{ui.setGoalTitle}</h2><p>{ui.goalExample}</p><button className="primary" onClick={() => write("director")}>{ui.writeDirector} <ArrowRight size={16} /></button></article>
           <article><span className="step-number">2</span><h2>{ui.recordWork}</h2><p>{ui.taskGuide}</p><button className="secondary" onClick={() => setView("tasks")}>{ui.planTask} <ArrowRight size={16} /></button></article>
           <article><span className="step-number">3</span><h2>{ui.reviewResults}</h2><p>{ui.reviewGuide}</p><button className="secondary" onClick={() => setView("tasks")}>{ui.viewTasks} <ArrowRight size={16} /></button></article>

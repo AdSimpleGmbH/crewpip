@@ -156,6 +156,11 @@ export const de = {
   succeeded: "erfolgreich",
   failed: "fehlgeschlagen",
 
+  connectChat: "Ersten Chat verbinden",
+  firstDelivery: "Erste Nachricht zustellen",
+  connectUrl: "https://github.com/ostheimer/crewpip/blob/main/README.de.md#den-ersten-chat-verbinden",
+  deliveryUrl: "https://github.com/ostheimer/crewpip/blob/main/README.de.md#die-erste-nachricht-zustellen",
+
   pendingChats: (n: number) => n === 1 ? "1 Chat wartet auf Zustellung" : `${n} Chats warten auf Zustellung`,
   allProjectCount: (n: number) => `Alle ${n} Projekte anzeigen`,
   registered: (n: number) => n === 1 ? "1 Chat angemeldet" : `${n} Chats angemeldet`,

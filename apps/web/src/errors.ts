@@ -3,7 +3,7 @@ import type { Language } from "./language.tsx";
 // The daemon is shared with existing clients and returns German diagnostics.
 // Only translate known messages at the display boundary. Preserve names and tool output.
 const english: Record<string, string> = {
-  "Verbindung fehlgeschlagen": "Connection failed",
+  "Verbindung fehlgeschlagen.": "Connection failed.",
   "Verbindung fehlgeschlagen. Bitte erneut versuchen.": "Connection failed. Please try again.",
   "Verbindung fehlgeschlagen. Der Start ist nicht bestätigt; vor erneutem Start die Läufe prüfen.": "Connection failed. Check the run list before starting another run.",
   "Agentenstatus konnte nicht geladen werden. Aufgaben bleiben bedienbar.": "Could not load agent status. You can still use tasks.",
