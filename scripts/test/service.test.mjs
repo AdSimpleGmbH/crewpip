@@ -143,11 +143,37 @@ exit 1
   );
 }
 
+const standardBins = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+test("Standardverzeichnisse bleiben nach einem Node-Wechsel einmal in ihrer ursprünglichen Rangfolge", async () => {
+  const { serviceRuntime, daemonEntry } = await import("../service-runtime.mjs");
+  const nextBin = path.dirname(process.execPath);
+  const custom = "/company tools";
+  for (const previousBin of standardBins) {
+    const previousPath = [...new Set([previousBin, custom, ...standardBins, "/other tools"])];
+    const configuration = {
+      ProgramArguments: [path.join(previousBin, "node"), daemonEntry(repo)],
+      EnvironmentVariables: { PATH: previousPath.join(":") },
+    };
+    const expected = [...new Set([nextBin, custom, ...standardBins, "/other tools"])];
+    assert.deepEqual(serviceRuntime(repo, configuration).searchPath.split(":"), expected, previousBin);
+    configuration.EnvironmentVariables.PATH = [custom, previousBin, "/other tools"].join(":");
+    assert.equal(serviceRuntime(repo, configuration).searchPath, configuration.EnvironmentVariables.PATH);
+  }
+});
+
 const runtimeCases = [
+  { action: "restart", upgrade: true, managed: true, systemNode: true },
   { action: "migrate", upgrade: true, managed: true },
   { action: "migrate", upgrade: true, managed: false },
   { action: "migrate", upgrade: false, managed: true },
-  { action: "restart", upgrade: false, managed: true, sameCheckout: true, nodeFlags: ["--enable-source-maps"] },
+  {
+    action: "restart",
+    upgrade: false,
+    managed: true,
+    sameCheckout: true,
+    nodeFlags: ["--enable-source-maps"],
+  },
   { action: "restart", upgrade: false, managed: true, sameCheckout: true, nodeFlags: ["--trace-gc"] },
   {
     action: "install",
@@ -160,8 +186,13 @@ const runtimeCases = [
   ),
 ];
 
-for (const { action, upgrade, managed, sameCheckout, nodeFlags = [] } of runtimeCases) {
-  test(`${nodeFlags.length ? "Node-Optionen " + nodeFlags[0] + ", " : ""}${sameCheckout ? "bestehender Checkout" : "Ersatzcheckout"} bei ${action}, ${upgrade ? "neuer" : "gleicher"} Node und ${managed ? "verwaltetem" : "individuellem"} PATH`, async (t) => {
+for (const { action, upgrade, managed, systemNode, sameCheckout, nodeFlags = [] } of runtimeCases) {
+  const setup = systemNode
+    ? "System-CLI nach Node-Wechsel"
+    : sameCheckout
+      ? "bestehender Checkout"
+      : "Ersatzcheckout";
+  test(`${nodeFlags.length ? "Node-Optionen " + nodeFlags[0] + ", " : ""}${setup} bei ${action}, ${upgrade ? "neuer" : "gleicher"} Node und ${managed ? "verwaltetem" : "individuellem"} PATH`, async (t) => {
     const { legacyName, oldLabel } = await import("../migration.mjs");
     const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-checkout-")));
     const pidFile = path.join(home, "fixture.pid");
@@ -176,8 +207,8 @@ for (const { action, upgrade, managed, sameCheckout, nodeFlags = [] } of runtime
     const priorCheckout = sameCheckout ? checkout : path.join(home, "previous");
     const daemon = "apps/daemon/dist/index.js";
     const args = action === "migrate" && upgrade ? [] : ["--example", "extra value"];
-    const newBin = path.join(home, "v2/bin");
-    const oldBin = upgrade ? path.join(home, "v1/bin") : newBin;
+    const newBin = path.join(home, systemNode ? ".nvm/versions/node/v22.18.0/bin" : "v2/bin");
+    const oldBin = systemNode ? "/usr/bin" : upgrade ? path.join(home, "v1/bin") : newBin;
     const custom = path.join(home, "company/bin");
     for (const bin of [newBin, custom]) {
       fs.mkdirSync(bin, { recursive: true });
@@ -248,8 +279,17 @@ pid.write_text(str(child.pid))
     fs.writeFileSync(path.join(data, "token"), "fixture-only\n");
     const agents = path.join(home, "Library/LaunchAgents");
     const env = { HOME: home, PATH: shimDir + ":" + process.env.PATH };
-    const searchPath = managed ? [oldBin, custom, "/usr/bin"] : [custom, oldBin, "/usr/bin"];
-    const expectedPath = managed ? [newBin, custom, "/usr/bin"] : searchPath;
+    const fallbackBins = systemNode ? standardBins : ["/usr/bin"];
+    const searchPath = managed
+      ? [...new Set([oldBin, custom, ...fallbackBins])]
+      : [custom, oldBin, ...fallbackBins];
+    const expectedPath = managed ? [newBin, custom, ...fallbackBins] : searchPath;
+    const systemCli = (search) =>
+      execFileSync("getconf", ["ARG_MAX"], {
+        env: { HOME: home, PATH: search },
+        encoding: "utf8",
+      }).trim();
+    if (systemNode) assert.match(systemCli(searchPath.join(":")), /^\d+$/);
     fs.mkdirSync(agents, { recursive: true });
     fs.writeFileSync(
       path.join(agents, label + ".plist"),
@@ -283,6 +323,7 @@ pid.write_text(str(child.pid))
     }
     assert.equal(health?.status, 200, "Der gestartete Test-Build muss erreichbar sein");
     const report = await health.json();
+    if (systemNode) assert.match(systemCli(report.path), /^\d+$/);
     assert.equal(report.entry, path.join(checkout, daemon), "Health antwortet aus dem falschen Checkout");
     assert.equal(report.cwd, checkout);
     assert.equal(

@@ -2,6 +2,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 const daemonScript = "apps/daemon/dist/index.js";
+const standardBins = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 export const daemonEntry = (repo) => path.join(repo, daemonScript);
 
@@ -95,11 +96,21 @@ export function serviceRuntime(repo, configuration, { allowNodeOptions = true } 
     const previousBin = path.dirname(previous[0]);
     const directories = searchPath?.split(path.delimiter);
     if (previousBin !== nextBin && directories?.[0] === previousBin) {
-      searchPath = [nextBin, ...directories.slice(1).filter((dir) => dir !== nextBin)].join(path.delimiter);
+      const oldRank = standardBins.indexOf(previousBin);
+      const remaining = directories
+        .slice(1)
+        .filter((dir) => dir !== nextBin && (oldRank < 0 || dir !== previousBin));
+      if (oldRank >= 0) {
+        // Die Erstinstallation hat den Standardpfad mit dem damals vorangestellten Node-Bin zusammengefasst.
+        const laterBins = standardBins.slice(oldRank + 1);
+        let slot = remaining.findIndex((dir) => laterBins.includes(dir));
+        if (slot < 0) slot = remaining.findLastIndex((dir) => standardBins.includes(dir)) + 1;
+        remaining.splice(slot, 0, previousBin);
+      }
+      searchPath = [nextBin, ...remaining].join(path.delimiter);
     }
   } else {
-    const defaults = [nextBin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-    searchPath = [...new Set(defaults)].join(path.delimiter);
+    searchPath = [...new Set([nextBin, ...standardBins])].join(path.delimiter);
   }
   return { args, workingDirectory: repo, searchPath };
 }
