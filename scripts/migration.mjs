@@ -191,6 +191,18 @@ function hasTable(db, table) {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
 }
 
+const unresolvedPath = (error) =>
+  ["ENOENT", "ENOTDIR", "ELOOP", "EACCES", "EPERM", "ESTALE", "ENAMETOOLONG"].includes(error.code);
+
+function realDirectory(file) {
+  try {
+    return fs.realpathSync.native(file);
+  } catch (error) {
+    if (unresolvedPath(error)) return null;
+    throw error;
+  }
+}
+
 // Der gespeicherte Weg kann über einen Alias in den Worktree und über einen
 // weiteren Link wieder hinaus führen. Schon beim Eintritt wird sein noch
 // unaufgelöster Rest übernommen, auch bei inzwischen gelöschten Unterordnern.
@@ -220,8 +232,7 @@ function worktreeCwds(trees) {
         stat = fs.lstatSync(file, { bigint: true });
         if (stat.isSymbolicLink()) link = fs.readlinkSync(file);
       } catch (error) {
-        if (["ENOENT", "ENOTDIR", "ELOOP", "EACCES", "EPERM", "ESTALE", "ENAMETOOLONG"].includes(error.code))
-          return null;
+        if (unresolvedPath(error)) return null;
         throw error;
       }
       if (link !== undefined) {
@@ -310,7 +321,29 @@ function inventory(dbfile) {
   });
 }
 
-function updateData(dir, old, current, trees) {
+// Solange die ursprünglichen Worktrees noch existieren, sowohl den logischen
+// Zugang als auch das physische Ziel erfassen. Absolute Benutzerlinks dürfen
+// nach dem Umzug ins Leere zeigen, ohne dass die Historie ihr Ziel verliert.
+function historicalCwds(dbfile, trees) {
+  const locations = new Map();
+  if (!trees.length) return locations;
+  const relocate = worktreeCwds(trees);
+  withDb(dbfile, true, (db) => {
+    for (const table of ["sessions", "runs"]) {
+      if (!hasTable(db, table)) continue;
+      for (const { cwd } of db.prepare(`SELECT DISTINCT cwd FROM ${table}`).all()) {
+        if (locations.has(cwd)) continue;
+        const logical = relocate(cwd);
+        if (!logical || logical === cwd) continue;
+        const real = realDirectory(cwd);
+        locations.set(cwd, { logical, physical: real && relocate(real) });
+      }
+    }
+  });
+  return locations;
+}
+
+function updateData(dir, old, current, trees, locations) {
   for (const suffix of ["", "-wal", "-shm", "-journal"]) {
     const file = path.join(dir, oldDb + suffix);
     if (exists(path.join(dir, newDb + suffix)))
@@ -335,13 +368,17 @@ function updateData(dir, old, current, trees) {
           "UPDATE runs SET log_path=? || substr(log_path,length(?)+1) WHERE log_path=? OR substr(log_path,1,length(?)+1)=? || '/'",
         ).run(current, old, old, old, old);
       }
-      const relocate = worktreeCwds(trees);
       for (const table of ["sessions", "runs"]) {
-        if (!trees.length || !hasTable(db, table)) continue;
+        if (!locations.size || !hasTable(db, table)) continue;
         const update = db.prepare(`UPDATE ${table} SET cwd=? WHERE cwd=?`);
-        for (const { cwd } of db.prepare(`SELECT DISTINCT cwd FROM ${table}`).all()) {
-          const relocated = relocate(cwd) ?? cwd;
-          if (relocated !== cwd) update.run(relocated, cwd);
+        for (const [cwd, { logical, physical }] of locations) {
+          let target = logical;
+          if (physical && logical !== physical) {
+            const expected = realDirectory(physical);
+            if (!expected) throw new Error("Ziel eines historischen CWD nach dem Umzug nicht erreichbar: " + cwd);
+            if (realDirectory(logical) !== expected) target = physical;
+          }
+          update.run(target, cwd);
         }
       }
       for (const tree of trees) {
@@ -596,7 +633,6 @@ export async function migrateInstallation({ repo, check = false, recover = false
     if (hasData) {
       fs.cpSync(old, staging, { recursive: true, verbatimSymlinks: true });
       fs.chmodSync(staging, 0o700);
-      updateData(staging, old, current, before.trees);
       if (!exists(path.join(staging, "token")))
         fs.writeFileSync(path.join(staging, "token"), savedToken + "\n", { mode: 0o600 });
     } else if (createsToken) {
@@ -607,7 +643,9 @@ export async function migrateInstallation({ repo, check = false, recover = false
       j.stagingInode = fs.statSync(staging).ino;
       atomic(journal, JSON.stringify(j));
     }
+    const locations = historicalCwds(dbfile, before.trees);
     for (const tree of before.trees) moveTree(tree);
+    if (hasData) updateData(staging, old, current, before.trees, locations);
     for (const [i, initial] of changes.entries()) {
       let change = initial;
       if (read(change.file) !== change.before) {

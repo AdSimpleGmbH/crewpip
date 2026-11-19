@@ -605,6 +605,46 @@ test("Projektalias und ausgehender Symlink sperren den belegten Worktree und erh
   }
 });
 
+for (const differentTree of [false, true]) {
+  test(`Historischer absoluter Symlink führt nach dem Umzug zum Ziel im ${differentTree ? "zweiten" : "selben"} Worktree`, (t) => {
+    const { home, old, current, project, git, oldTree, newTree, command } = fixture(t);
+    const oldTarget = differentTree ? path.join(path.dirname(oldTree), "other") : oldTree;
+    const newTarget = differentTree ? path.join(path.dirname(newTree), "other") : newTree;
+    const db = new DatabaseSync(path.join(old, legacyName + ".db"));
+    if (differentTree) {
+      const branch = legacyName + "/other";
+      git(project, "worktree", "add", "-b", branch, oldTarget);
+      db.prepare("INSERT INTO tasks VALUES (2,'p',?,?)").run(oldTarget, branch);
+    }
+    const linked = path.join(oldTarget, "nested");
+    fs.mkdirSync(linked);
+    fs.writeFileSync(path.join(linked, "marker"), "same directory");
+    fs.symlinkSync(linked, path.join(oldTree, "linked"), "dir");
+    const alias = path.join(home, "project-alias");
+    fs.symlinkSync(project, alias, "dir");
+    const cwd = path.join(alias, path.relative(project, oldTree), "linked");
+    assert.equal(fs.readFileSync(path.join(cwd, "marker"), "utf8"), "same directory");
+    db.exec("ALTER TABLE sessions ADD COLUMN ended_at TEXT");
+    db.prepare("UPDATE sessions SET cwd=?,ended_at='2026-01-01'").run(cwd);
+    db.prepare("UPDATE runs SET cwd=?").run(cwd);
+    db.close();
+
+    const result = command();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readlinkSync(path.join(newTree, "linked")), linked);
+    const after = new DatabaseSync(path.join(current, "crewpip.db"), { readOnly: true });
+    try {
+      for (const table of ["sessions", "runs"]) {
+        const stored = after.prepare(`SELECT cwd FROM ${table}`).get().cwd;
+        assert.equal(fs.readFileSync(path.join(stored, "marker"), "utf8"), "same directory");
+        assert.equal(stored, path.join(newTarget, "nested"));
+      }
+    } finally {
+      after.close();
+    }
+  });
+}
+
 test("Fremder zyklischer CWD sperrt offene Sitzungen und bleibt als historischer Pfad erhalten", (t) => {
   const { home, old, current, command } = fixture(t);
   const cycle = path.join(home, "cycle");
