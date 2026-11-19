@@ -7,16 +7,23 @@ import http from "node:http";
 import { once } from "node:events";
 import { promisify } from "node:util";
 import { execFile, execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const run = promisify(execFile);
 const repo = fileURLToPath(new URL("../..", import.meta.url));
 
-for (const action of ["install", "restart"]) {
+for (const [action, managed] of [
+  ["install", true],
+  ["install", false],
+  ["restart", true],
+  ["restart", false],
+]) {
   test(
-    action + " aktualisiert den Node-Pfad einer bestehenden Plist und erhält deren Einstellungen",
+    action +
+      " nach Node-Upgrade erhält " +
+      (managed ? "den verwalteten Suchpfad des Runners" : "einen individuellen PATH"),
     async (t) => {
-      const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-node-upgrade-"));
+      const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-node-upgrade-")));
       t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
       const checkout = path.join(sandbox, "checkout");
       fs.mkdirSync(checkout);
@@ -33,7 +40,7 @@ for (const action of ["install", "restart"]) {
         `#!/bin/sh
 case "$1" in
   print) echo 'Could not find service' >&2; exit 113 ;;
-  bootout) exit 0 ;;
+  bootout) rm -f "$HOME/loaded"; exit 0 ;;
   bootstrap) touch "$HOME/loaded"; exit 0 ;;
 esac
 exit 1
@@ -54,6 +61,39 @@ exit 1
         APP_SETTING: "retain",
       };
       const previous = path.join(sandbox, "Cellar/node/old/bin/node");
+      const next = path.join(sandbox, "Cellar/node/new/bin/node");
+      fs.mkdirSync(path.dirname(next), { recursive: true });
+      fs.copyFileSync(process.execPath, next, fs.constants.COPYFILE_FICLONE);
+      const nextBin = path.dirname(next),
+        priorBin = path.dirname(previous);
+      const testCli = path.join(nextBin, "claude");
+      fs.writeFileSync(testCli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      const command = path.join(checkout, "scripts/service.mjs");
+      const serviceEnv = {
+        HOME: sandbox,
+        PATH: bin + ":" + process.env.PATH,
+        CREWPIP_PORT: env.CREWPIP_PORT,
+        CREWPIP_TOKEN: "fixture-only",
+      };
+      const custom = path.join(sandbox, "company tools");
+      const plist = path.join(sandbox, "Library/LaunchAgents/crewpip.plist");
+      let searchPath;
+      if (managed) {
+        fs.mkdirSync(priorBin, { recursive: true });
+        fs.copyFileSync(process.execPath, previous, fs.constants.COPYFILE_FICLONE);
+        await run(previous, [command, "install"], { env: serviceEnv, timeout: 15000 });
+        const initial = JSON.parse(execFileSync("plutil", ["-convert", "json", "-o", "-", plist]));
+        assert.equal(initial.ProgramArguments[0], previous);
+        searchPath = initial.EnvironmentVariables.PATH.split(":");
+        assert.equal(searchPath[0], priorBin);
+        searchPath.splice(1, 0, custom);
+        // Eine vorhandene Referenz desselben Zielpfads darf keine Dublette erzeugen.
+        if (action === "install") searchPath.push(nextBin);
+        fs.rmSync(previous);
+      } else {
+        searchPath = [custom, priorBin, "/usr/bin"];
+      }
+      env.PATH = searchPath.join(":");
       const installed = {
         Label: "crewpip",
         ProgramArguments: [previous, entry, "extra argument"],
@@ -63,7 +103,6 @@ exit 1
         RunAtLoad: true,
         ThrottleInterval: 12,
       };
-      const plist = path.join(sandbox, "Library/LaunchAgents/crewpip.plist");
       fs.mkdirSync(path.dirname(plist), { recursive: true });
       fs.writeFileSync(
         plist,
@@ -72,13 +111,33 @@ exit 1
         }),
         { mode: 0o600 },
       );
-      await run(process.execPath, [path.join(checkout, "scripts/service.mjs"), action], {
-        env: { HOME: sandbox, PATH: bin + ":" + process.env.PATH },
+      await run(next, [command, action], {
+        env: serviceEnv,
         timeout: 15000,
       });
       const actual = JSON.parse(execFileSync("plutil", ["-convert", "json", "-o", "-", plist]));
-      assert.equal(actual.ProgramArguments[0], process.execPath);
-      assert.deepEqual(actual, { ...installed, ProgramArguments: [process.execPath, entry, "extra argument"] });
+      assert.equal(actual.ProgramArguments[0], next);
+      if (managed) {
+        const runner = pathToFileURL(path.join(repo, "apps/daemon/src/runner/apps.ts")).href;
+        const found = execFileSync(
+          next,
+          [
+            "--input-type=module",
+            "-e",
+            `import {claudeApp} from ${JSON.stringify(runner)}; console.log(claudeApp.bin());`,
+          ],
+          { env: { HOME: sandbox, PATH: actual.EnvironmentVariables.PATH }, encoding: "utf8" },
+        ).trim();
+        assert.equal(found, testCli);
+      }
+      const expectedPath = managed
+        ? [nextBin, ...searchPath.slice(1).filter((dir) => dir !== nextBin)]
+        : searchPath;
+      assert.deepEqual(actual, {
+        ...installed,
+        ProgramArguments: [next, entry, "extra argument"],
+        EnvironmentVariables: { ...env, PATH: expectedPath.join(":") },
+      });
       assert.equal(fs.statSync(plist).mode & 0o777, 0o600);
     },
   );

@@ -139,6 +139,35 @@ async function waitHealthy(tries = 20) {
   return null;
 }
 
+function refreshNode(configuration) {
+  const args = configuration.ProgramArguments;
+  if (!Array.isArray(args) || typeof args[0] !== "string")
+    throw new Error("ProgramArguments fehlen in der Dienst-Plist");
+  const previousBin = path.dirname(args[0]);
+  const nextBin = path.dirname(process.execPath);
+  const directories = configuration.EnvironmentVariables?.PATH?.split(path.delimiter);
+  const temporary = fs.mkdtempSync(path.join(path.dirname(plistPath), ".crewpip-"));
+  const staged = path.join(temporary, "service.plist");
+  try {
+    // Erst beide Änderungen mit den vorhandenen Dateirechten vorbereiten. So
+    // kann ein fehlgeschlagener Aufruf den Interpreter und PATH nicht trennen.
+    execFileSync("/bin/cp", ["-p", plistPath, staged], { stdio: "ignore" });
+    const change = (key, type, value) => {
+      const result = spawnSync("plutil", ["-replace", key, type, value, "--", staged], { stdio: "ignore" });
+      if (result.status !== 0) throw new Error("Dienst-Plist konnte nicht aktualisiert werden: " + key);
+    };
+    // Ein numerischer letzter Schlüsselpfad würde bei plutil ein Element einfügen.
+    change("ProgramArguments", "-json", JSON.stringify([process.execPath, ...args.slice(1)]));
+    if (previousBin !== nextBin && directories?.[0] === previousBin) {
+      const pathEntries = [nextBin, ...directories.slice(1).filter((dir) => dir !== nextBin)];
+      change("EnvironmentVariables.PATH", "-string", pathEntries.join(path.delimiter));
+    }
+    fs.renameSync(staged, plistPath);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const cmd = process.argv[2];
   switch (cmd) {
@@ -172,20 +201,7 @@ async function main() {
       if (!installed) {
         fs.writeFileSync(plistPath, plist(), { flag: "wx", mode: 0o600 });
       } else if (installed.ProgramArguments?.[0] !== process.execPath) {
-        // Ein Node-Upgrade kann den bisherigen versionsgebundenen Pfad entfernen.
-        // Nur den Interpreter austauschen, bevor der laufende Dienst gestoppt wird.
-        const args = installed.ProgramArguments;
-        if (!Array.isArray(args) || !args.length) throw new Error("ProgramArguments fehlen in der Dienst-Plist");
-        const argumentsJson = JSON.stringify([process.execPath, ...args.slice(1)]);
-        // plutil fügt bei einem numerischen letzten Schlüsselpfad ein Arrayelement ein.
-        const update = spawnSync(
-          "plutil",
-          ["-replace", "ProgramArguments", "-json", argumentsJson, "--", plistPath],
-          {
-            stdio: "ignore",
-          },
-        );
-        if (update.status !== 0) throw new Error("Node-Pfad in der Dienst-Plist konnte nicht aktualisiert werden");
+        refreshNode(installed);
       }
       await bootout();
       bootstrap();

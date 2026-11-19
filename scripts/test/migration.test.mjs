@@ -562,3 +562,72 @@ test("Historische Sitzungs- und Laufpfade unter einem Symlink werden passend zum
     db.close();
   }
 });
+
+test("Projektalias und ausgehender Symlink sperren den belegten Worktree und erhalten später den gespeicherten Unterpfad", (t) => {
+  const { home, old, current, project, oldTree, newTree, command } = fixture(t);
+  const projectAlias = path.join(home, "project-alias");
+  const outside = path.join(home, "outside");
+  fs.mkdirSync(path.join(outside, "nested"), { recursive: true });
+  fs.writeFileSync(path.join(outside, "nested", "record"), "preserved");
+  fs.symlinkSync(project, projectAlias, "dir");
+  fs.symlinkSync(outside, path.join(oldTree, "linked"), "dir");
+  const cwd = path.join(projectAlias, path.relative(project, oldTree), "linked", "nested");
+  const throughLink = path.join(home, "through-worktree");
+  fs.symlinkSync(cwd, throughLink, "dir");
+  const dbFile = path.join(old, legacyName + ".db");
+  const db = new DatabaseSync(dbFile);
+  db.exec("ALTER TABLE sessions ADD COLUMN ended_at TEXT");
+  db.prepare("UPDATE sessions SET cwd=?").run(cwd);
+  db.prepare("UPDATE runs SET cwd=?").run(throughLink);
+  db.close();
+  assert.equal(fs.realpathSync(cwd), path.join(outside, "nested"));
+  for (const args of [["migrate", "--check"], ["migrate"]]) {
+    const result = command(...args);
+    assert.notEqual(result.status, 0, "Belegter Worktree unter Projektalias wurde freigegeben");
+    assert.match(result.stderr, /geöffneter Chat verwendet/);
+    assert.equal(fs.readFileSync(path.join(cwd, "record"), "utf8"), "preserved");
+    assert.ok(!fs.existsSync(current));
+  }
+  const ended = new DatabaseSync(dbFile);
+  ended.exec("UPDATE sessions SET ended_at='2026-01-01'");
+  ended.close();
+  const migrated = command();
+  assert.equal(migrated.status, 0, migrated.stderr);
+  const newDb = new DatabaseSync(path.join(current, "crewpip.db"), { readOnly: true });
+  try {
+    for (const table of ["sessions", "runs"]) {
+      const stored = newDb.prepare(`SELECT cwd FROM ${table}`).get().cwd;
+      assert.equal(stored, path.join(newTree, "linked", "nested"));
+      assert.equal(fs.readFileSync(path.join(stored, "record"), "utf8"), "preserved");
+    }
+  } finally {
+    newDb.close();
+  }
+});
+
+test("Fremder zyklischer CWD sperrt offene Sitzungen und bleibt als historischer Pfad erhalten", (t) => {
+  const { home, old, current, command } = fixture(t);
+  const cycle = path.join(home, "cycle");
+  fs.symlinkSync("cycle", cycle);
+  const dbFile = path.join(old, legacyName + ".db");
+  const db = new DatabaseSync(dbFile);
+  db.exec("ALTER TABLE sessions ADD COLUMN ended_at TEXT");
+  db.prepare("UPDATE sessions SET cwd=?").run(cycle);
+  db.prepare("UPDATE runs SET cwd=?").run(cycle);
+  db.close();
+  const active = command("migrate", "--check");
+  assert.notEqual(active.status, 0, "Unsicherer CWD eines offenen Chats wurde freigegeben");
+  assert.ok(!fs.existsSync(current));
+  const ended = new DatabaseSync(dbFile);
+  ended.exec("UPDATE sessions SET ended_at='2026-01-01'");
+  ended.close();
+  const migrated = command();
+  assert.equal(migrated.status, 0, migrated.stderr);
+  const newDb = new DatabaseSync(path.join(current, "crewpip.db"), { readOnly: true });
+  try {
+    for (const table of ["sessions", "runs"])
+      assert.equal(newDb.prepare(`SELECT cwd FROM ${table}`).get().cwd, cycle);
+  } finally {
+    newDb.close();
+  }
+});

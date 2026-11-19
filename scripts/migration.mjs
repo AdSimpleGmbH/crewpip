@@ -191,33 +191,60 @@ function hasTable(db, table) {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
 }
 
-// Bei historischen CWDs kann ein Unterverzeichnis inzwischen gelöscht sein.
-// In diesem Fall den vorhandenen Vorfahren physisch auflösen und den Rest anhängen.
-function resolveStoredPath(stored) {
-  const tail = [];
-  let parent = stored;
-  for (;;) {
-    try {
-      return path.join(fs.realpathSync.native(parent), ...tail.reverse());
-    } catch (error) {
-      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
-      const next = path.dirname(parent);
-      if (next === parent) return stored;
-      tail.push(path.basename(parent));
-      parent = next;
+// Der gespeicherte Weg kann über einen Alias in den Worktree und über einen
+// weiteren Link wieder hinaus führen. Schon beim Eintritt wird sein noch
+// unaufgelöster Rest übernommen, auch bei inzwischen gelöschten Unterordnern.
+function worktreeCwds(trees) {
+  const identity = (stat) => stat.dev + ":" + stat.ino;
+  const targets = new Map(trees.map((tree) => [identity(fs.statSync(tree.old, { bigint: true })), tree.current]));
+  return (cwd) => {
+    if (!targets.size) return cwd;
+    if (!path.isAbsolute(cwd)) return null;
+    const pending = cwd.split(path.sep).reverse();
+    const resolving = new Set();
+    let directory = path.parse(cwd).root;
+    while (pending.length) {
+      const component = pending.pop();
+      if (typeof component !== "string") {
+        resolving.delete(component.link);
+        continue;
+      }
+      if (!component || component === ".") continue;
+      if (component === "..") {
+        directory = path.dirname(directory);
+        continue;
+      }
+      const file = path.join(directory, component);
+      let stat, link;
+      try {
+        stat = fs.lstatSync(file, { bigint: true });
+        if (stat.isSymbolicLink()) link = fs.readlinkSync(file);
+      } catch (error) {
+        if (["ENOENT", "ENOTDIR", "ELOOP", "EACCES", "EPERM", "ESTALE", "ENAMETOOLONG"].includes(error.code))
+          return null;
+        throw error;
+      }
+      if (link !== undefined) {
+        if (resolving.has(file)) return null;
+        resolving.add(file);
+        // Markierung beendet nur diese Linkauflösung. Ein späterer, nicht
+        // zyklischer zweiter Besuch desselben Links bleibt damit zulässig.
+        pending.push({ link: file }, ...link.split(path.sep).reverse());
+        if (path.isAbsolute(link)) directory = path.sep;
+        continue;
+      }
+      const target = targets.get(identity(stat));
+      if (target) {
+        const suffix = pending
+          .reverse()
+          .filter((part) => typeof part === "string" && part !== "")
+          .join(path.sep);
+        return suffix ? target + path.sep + suffix : target;
+      }
+      directory = file;
     }
-  }
-}
-
-function relocatedCwd(cwd, trees) {
-  if (!trees.length || !path.isAbsolute(cwd)) return cwd;
-  function replacePrefix(value) {
-    const tree = trees.find(({ old }) => value === old || value.startsWith(old + path.sep));
-    return tree && tree.current + value.slice(tree.old.length);
-  }
-  // Auch ein Symlink innerhalb des Worktrees wird mit ihm verschoben. Deshalb
-  // zuerst den gespeicherten Pfad prüfen, anschließend externe Aliase auflösen.
-  return replacePrefix(cwd) ?? replacePrefix(resolveStoredPath(cwd)) ?? cwd;
+    return cwd;
+  };
 }
 
 function inventory(dbfile) {
@@ -271,10 +298,12 @@ function inventory(dbfile) {
         .all()
         .some((c) => c.name === "ended_at")
     ) {
+      const relocate = worktreeCwds(trees);
       const open = db.prepare("SELECT DISTINCT cwd FROM sessions WHERE ended_at IS NULL").all();
       for (const { cwd } of open) {
-        if (relocatedCwd(cwd, trees) !== cwd)
-          throw new Error("Ein geöffneter Chat verwendet den umzuziehenden Worktree: " + cwd);
+        const mapped = relocate(cwd);
+        if (mapped === null) throw new Error("CWD eines geöffneten Chats vor dem Umzug klären: " + cwd);
+        if (mapped !== cwd) throw new Error("Ein geöffneter Chat verwendet den umzuziehenden Worktree: " + cwd);
       }
     }
     return { projects, trees };
@@ -306,11 +335,12 @@ function updateData(dir, old, current, trees) {
           "UPDATE runs SET log_path=? || substr(log_path,length(?)+1) WHERE log_path=? OR substr(log_path,1,length(?)+1)=? || '/'",
         ).run(current, old, old, old, old);
       }
+      const relocate = worktreeCwds(trees);
       for (const table of ["sessions", "runs"]) {
         if (!trees.length || !hasTable(db, table)) continue;
         const update = db.prepare(`UPDATE ${table} SET cwd=? WHERE cwd=?`);
         for (const { cwd } of db.prepare(`SELECT DISTINCT cwd FROM ${table}`).all()) {
-          const relocated = relocatedCwd(cwd, trees);
+          const relocated = relocate(cwd) ?? cwd;
           if (relocated !== cwd) update.run(relocated, cwd);
         }
       }
