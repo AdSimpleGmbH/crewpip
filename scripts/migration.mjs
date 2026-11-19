@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { configChanges, installationToken, restoreConfig } from "./migrate-config.mjs";
+import { checkForeignEnvReferences, configChanges, installationToken, restoreConfig } from "./migrate-config.mjs";
 import { daemonEntry, serviceRuntime } from "./service-runtime.mjs";
 
 export const oldLabel = "at.ostheimer." + legacyName;
@@ -539,6 +539,7 @@ export async function migrateInstallation({ repo, check = false, recover = false
     throw new Error("Zieldatenbank oder Sidecardatei im bisherigen Datenordner bereits belegt");
   const before = inventory(dbfile);
   const plist = exists(oldPlist) ? buildPlist(oldPlist, repo, old, current) : null;
+  checkForeignEnvReferences(home, legacyName, plist?.renamedEnv);
   const changes = configChanges(home, repo, legacyName, plist?.renamedEnv);
   if (configOnly && !changes.length) {
     console.log("Kein Bestandsumzug erforderlich.");
@@ -672,6 +673,8 @@ export async function migrateInstallation({ repo, check = false, recover = false
       fs.renameSync(staging, current);
     }
     if (plist) {
+      // Auch ein parallel ergänzter Fremdbezug in einer sonst unveränderten Config zählt.
+      checkForeignEnvReferences(home, legacyName, plist.renamedEnv);
       atomic(newPlist, plist.bytes);
       fs.unlinkSync(oldPlist);
       if (wasLoaded) {

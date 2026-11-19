@@ -290,6 +290,40 @@ function tomlConfig(source, old, renamedEnv) {
   return result;
 }
 
+// Andere MCP-Einträge dürfen ihre explizit vom LaunchAgent geerbte Quelle
+// nicht verlieren. Nur Variablennamen vergleichen, keine Fremdzugänge auflösen.
+export function checkForeignEnvReferences(home, old, renamedEnv) {
+  if (!renamedEnv?.size) return;
+  const file = path.join(home, ".codex/config.toml");
+  if (!fs.existsSync(file)) return;
+  let source, servers;
+  try {
+    source = fs.readFileSync(file, "utf8");
+    servers = parse(source).mcp_servers ?? {};
+  } catch {
+    throw new Error("Konfiguration nicht sicher übernehmbar: " + file);
+  }
+  for (const [index, [id, server]] of Object.entries(servers).entries()) {
+    if (id === old || id === "crewpip") continue;
+    let field;
+    if (renamedEnv.has(server.bearer_token_env_var)) field = "bearer_token_env_var";
+    else if (Object.values(server.env_http_headers ?? {}).some((name) => renamedEnv.has(name)))
+      field = "env_http_headers";
+    if (!field) continue;
+    const line = source.split("\n").findIndex((text) => {
+      const match =
+        /^\s*\[\s*(?:"mcp_servers"|'mcp_servers'|mcp_servers)\s*\.\s*(?:"([^"\\]*)"|'([^']*)'|([\w-]+))\s*[.\]]/.exec(
+          text,
+        );
+      return match && (match[1] ?? match[2] ?? match[3]) === id;
+    });
+    const location = line >= 0 ? file + ":" + (line + 1) : file;
+    throw new Error(
+      `MCP-Eintrag Nr. ${index + 1} in ${location} bezieht über ${field} eine bisherige LaunchAgent-Variable. Diesen Bezug vor dem Umzug klären.`,
+    );
+  }
+}
+
 export function configChanges(home, repo, old, renamedEnv) {
   const files = [".claude.json", ".claude/settings.json", ".codex/config.toml", ".codex/hooks.json"].map((f) =>
     path.join(home, f),

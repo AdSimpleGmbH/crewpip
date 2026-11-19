@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
+import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
@@ -397,34 +399,42 @@ function checkMcp(home, app, childEnv = {}) {
   assert.equal(result.status, 0, result.stderr);
 }
 
+function configuredLaunchAgent(home, env, environment) {
+  const repo = builtServiceFixture(home);
+  const command = (action = "migrate", ...args) =>
+    spawnSync(process.execPath, [path.join(repo, "scripts/service.mjs"), action, ...args], {
+      env,
+      encoding: "utf8",
+    });
+  const agents = path.join(home, "Library/LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "bin/launchctl"),
+    '#!/bin/sh\nif [ "$1" = getenv ]; then exit 1; fi\necho "Could not find service" >&2; exit 113\n',
+    { mode: 0o700 },
+  );
+  const oldPlist = path.join(agents, oldLabel + ".plist");
+  fs.writeFileSync(
+    oldPlist,
+    JSON.stringify({
+      Label: oldLabel,
+      ProgramArguments: [process.execPath, path.join(repo, "apps/daemon/dist/index.js")],
+      EnvironmentVariables: environment,
+    }),
+  );
+  return { oldPlist, newPlist: path.join(agents, "crewpip.plist"), command };
+}
+
 for (const style of ["Header", "Bearer-Variable", "Authorization-Variable"]) {
   test(`LaunchAgent-Tokenquelle bleibt nach dem Umzug für den Codex-Runner erreichbar (${style})`, async (t) => {
     const { home, old, current, env } = fixture(t);
-    const repo = builtServiceFixture(home);
-    const command = (action = "migrate", ...args) =>
-      spawnSync(process.execPath, [path.join(repo, "scripts/service.mjs"), action, ...args], {
-        env,
-        encoding: "utf8",
-      });
     const previous = legacyName.toUpperCase() + (style === "Header" ? "_TOKEN" : "_CLIENT_KEY");
     const key = style === "Header" ? "CREWPIP_TOKEN" : "CREWPIP_CLIENT_KEY";
     const value = style === "Authorization-Variable" ? "Bearer local-test-secret" : "local-test-secret";
-    const agents = path.join(home, "Library/LaunchAgents");
-    fs.mkdirSync(agents, { recursive: true });
-    fs.writeFileSync(
-      path.join(home, "bin/launchctl"),
-      '#!/bin/sh\nif [ "$1" = getenv ]; then exit 1; fi\necho "Could not find service" >&2; exit 113\n',
-      { mode: 0o700 },
-    );
-    const oldPlist = path.join(agents, oldLabel + ".plist");
-    fs.writeFileSync(
-      oldPlist,
-      JSON.stringify({
-        Label: oldLabel,
-        ProgramArguments: [process.execPath, path.join(repo, "apps/daemon/dist/index.js")],
-        EnvironmentVariables: { [previous]: value, [legacyName.toUpperCase() + "_META"]: "fixture-metadata" },
-      }),
-    );
+    const { oldPlist, newPlist, command } = configuredLaunchAgent(home, env, {
+      [previous]: value,
+      [legacyName.toUpperCase() + "_META"]: "fixture-metadata",
+    });
     const file = path.join(home, ".codex/config.toml");
     fs.mkdirSync(path.dirname(file));
     const section = "[mcp_servers." + legacyName + "]";
@@ -440,7 +450,8 @@ for (const style of ["Header", "Bearer-Variable", "Authorization-Variable"]) {
         : style === "Bearer-Variable"
           ? "bearer_token_env_var = '" + previous + "'"
           : section.replace("]", ".env_http_headers]") + "\nAuthorization = '" + previous + "'";
-    const foreign = "[mcp_servers.other.env_http_headers]\nAuthorization = '" + previous + "' # unrelated\n";
+    const privateSource = style === "Header" ? "PRIVATE_OTHER_KEY" : legacyName.toUpperCase() + "_EXTERNAL";
+    const foreign = "[mcp_servers.other.env_http_headers]\nAuthorization = '" + privateSource + "' # unrelated\n";
     fs.writeFileSync(file, section + '\nurl="http://localhost:7357/mcp/codex"\n' + own + " # keep\n" + foreign);
     // Eine Migration aus der Shell kann die Quelle kennen. Der gestartete Runner
     // erhält danach ausschließlich die endgültige Plist.
@@ -458,9 +469,7 @@ for (const style of ["Header", "Bearer-Variable", "Authorization-Variable"]) {
     assert.equal(result.status, 0, result.stderr);
     const text = fs.readFileSync(file, "utf8");
     assert.ok(text.endsWith(foreign));
-    const plist = JSON.parse(
-      execFileSync("plutil", ["-convert", "json", "-o", "-", path.join(agents, "crewpip.plist")]),
-    );
+    const plist = JSON.parse(execFileSync("plutil", ["-convert", "json", "-o", "-", newPlist]));
     checkMcp(home, "codex", plist.EnvironmentVariables);
     const server = parseToml(text).mcp_servers.crewpip;
     assert.equal(
@@ -475,6 +484,74 @@ for (const style of ["Header", "Bearer-Variable", "Authorization-Variable"]) {
     }
     assert.equal(command().status, 0);
     assert.equal(fs.readFileSync(file, "utf8"), text);
+  });
+}
+
+for (const field of ["env_http_headers", "bearer_token_env_var"]) {
+  test(`Fremder Codex-MCP behält seine geerbte LaunchAgent-Variable (${field})`, async (t) => {
+    const { home, old, current, env } = fixture(t);
+    const source = legacyName.toUpperCase() + "_AUXILIARY";
+    const value = "fixture-private-credential";
+    const privateSource = "PRIVATE_AUXILIARY";
+    const { oldPlist, newPlist, command } = configuredLaunchAgent(home, env, {
+      [source]: value,
+      [privateSource]: value,
+    });
+    const originalPlist = fs.readFileSync(oldPlist);
+    const api = http.createServer((req, res) => {
+      const valid = req.headers.authorization === "Bearer " + value || req.headers["x-test"] === value;
+      res.writeHead(valid ? 200 : 401).end();
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    t.after(() => api.close());
+    const url = "http://127.0.0.1:" + api.address().port + "/mcp/private-fixture-route";
+    const toml = path.join(home, ".codex/config.toml");
+    fs.mkdirSync(path.dirname(toml));
+    const escaped = "\\u" + source.charCodeAt(0).toString(16).padStart(4, "0") + source.slice(1);
+    const ref = field === "env_http_headers" ? `{ "X-Test" = "${source}" }` : `"${escaped}"`;
+    const config = `[mcp_servers.companion]\nurl = "${url}"\n${field} = ${ref}\n`;
+    fs.writeFileSync(toml, config);
+    async function accessStatus() {
+      const plist = fs.existsSync(oldPlist) ? oldPlist : newPlist;
+      const childEnv = JSON.parse(
+        execFileSync("plutil", ["-convert", "json", "-o", "-", plist]),
+      ).EnvironmentVariables;
+      const foreign = parseToml(fs.readFileSync(toml, "utf8")).mcp_servers.companion;
+      const bearer = childEnv[foreign.bearer_token_env_var];
+      const token = childEnv[foreign.env_http_headers?.["X-Test"]];
+      const headers = new Headers();
+      if (bearer) headers.set("Authorization", "Bearer " + bearer);
+      if (token) headers.set("X-Test", token);
+      return (await fetch(foreign.url, { headers })).status;
+    }
+    assert.equal(await accessStatus(), 200);
+    for (const flags of [["--check"], []]) {
+      await t.test(flags.length ? "Vorprüfung" : "Umzug", async () => {
+        const result = command("migrate", ...flags);
+        assert.equal(await accessStatus(), 200, "Der fremde Dienst verweigert nach der Migration den Zugriff");
+        assert.notEqual(result.status, 0, "Die fremde Abhängigkeit wurde freigegeben");
+        assert.match(result.stderr, /config\.toml:1/);
+        assert.ok(result.stderr.includes(field));
+        for (const secret of [url, value]) assert.ok(!(result.stdout + result.stderr).includes(secret));
+        assert.equal(fs.readFileSync(toml, "utf8"), config);
+        assert.deepEqual(fs.readFileSync(oldPlist), originalPlist);
+        assert.ok(fs.existsSync(old) && !fs.existsSync(current) && !fs.existsSync(newPlist));
+        assert.ok(!fs.existsSync(path.join(home, ".crewpip-migration-backups")));
+      });
+    }
+    // Simuliert die Klärung durch den Eigentümer des anderen MCP.
+    const independent = config.replace(
+      ref,
+      field === "env_http_headers" ? `{ "X-Test" = "${privateSource}" }` : `"${privateSource}"`,
+    );
+    fs.writeFileSync(toml, independent);
+    assert.equal(await accessStatus(), 200);
+    const resumed = command();
+    assert.equal(resumed.status, 0, resumed.stderr);
+    assert.equal(fs.readFileSync(toml, "utf8"), independent);
+    assert.ok(fs.existsSync(newPlist) && !fs.existsSync(oldPlist));
+    assert.equal(await accessStatus(), 200);
   });
 }
 
