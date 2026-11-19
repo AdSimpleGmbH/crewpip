@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { parse as parseToml } from "smol-toml";
 import { fileURLToPath } from "node:url";
 import { legacyName, oldLabel } from "../migration.mjs";
 
@@ -60,12 +61,13 @@ function fixture(t, projectName = "project") {
   db.prepare("INSERT INTO sessions VALUES ('s',?)").run(oldTree);
   db.exec("INSERT INTO messages VALUES (8,'saved message'); INSERT INTO deliveries VALUES (8,'s')");
   db.close();
+  const env = { HOME: home, PATH: path.join(home, "bin") + ":" + process.env.PATH };
   const command = (action = "migrate", ...args) =>
     spawnSync(process.execPath, [service, action, ...args], {
-      env: { HOME: home, PATH: path.join(home, "bin") + ":" + process.env.PATH },
+      env,
       encoding: "utf8",
     });
-  return { home, old, current, project, git, oldTree, newTree, command };
+  return { home, old, current, project, git, oldTree, newTree, command, env };
 }
 
 test("Migration übernimmt Daten, Token, Run-Bezüge und den registrierten Git-Worktree genau einmal", (t) => {
@@ -216,6 +218,130 @@ test("Konfigurationsbestand ohne Datenordner behält das vereinbarte lokale Toke
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "local-test-secret\n");
   assert.equal(command().status, 0);
+});
+
+for (const layout of ["Claude-JSON", "Codex-Inlinetabelle", "Codex-Headertabelle"]) {
+  test(`Tokenheader mit gemischter Großschreibung (${layout}) liefert das ursprüngliche Token genau einmal`, (t) => {
+    const { home, old, current, command } = fixture(t);
+    fs.rmSync(old, { recursive: true });
+    const claude = layout === "Claude-JSON";
+    const file = path.join(home, claude ? ".claude.json" : ".codex/config.toml");
+    const legacyHeader = "X-" + legacyName.toUpperCase() + "-Token";
+    const token = "fixture-header-source";
+    const headers = {
+      [legacyHeader]: token,
+      [legacyHeader.toLowerCase()]: token,
+      "X-CrewPiP-TOKEN": token,
+      Other: "comma, hash# keep",
+    };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (claude) {
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          mcpServers: { [legacyName]: { url: "http://localhost:7357/mcp/claude", headers } },
+          other: 17,
+        }),
+      );
+    } else {
+      const fields = Object.entries(headers).map(([key, value]) => `"${key}" = "${value}"`);
+      const prefix = `[mcp_servers.${legacyName}]`;
+      const setting =
+        layout === "Codex-Inlinetabelle"
+          ? "http_headers = { " + fields.join(", ") + " } # retained"
+          : `[mcp_servers.${legacyName}.http_headers] # retained\n` + fields.join("\n");
+      fs.writeFileSync(file, `${prefix}\nurl = "http://localhost:7357/mcp/codex"\n${setting}\n[other]\nn = 17\n`);
+    }
+    const result = command();
+    assert.equal(result.status, 0, result.stderr);
+    const text = fs.readFileSync(file, "utf8");
+    const actual = claude
+      ? JSON.parse(text).mcpServers.crewpip.headers
+      : parseToml(text).mcp_servers.crewpip.http_headers;
+    assert.deepEqual({ ...actual }, { Other: headers.Other, "x-crewpip-token": token });
+    assert.equal(fs.readFileSync(path.join(current, "token"), "utf8").trim(), token);
+    if (claude) assert.equal(JSON.parse(text).other, 17);
+    else {
+      assert.match(text, /# retained/);
+      assert.ok(text.includes("[other]\nn = 17\n"));
+    }
+    assert.equal(command().status, 0);
+    assert.equal(fs.readFileSync(file, "utf8"), text);
+  });
+}
+
+test("Tokenheader mit gemischter Großschreibung und abweichendem JSON- oder TOML-Wert stoppt vor der Migration", (t) => {
+  const { home, old, current, command } = fixture(t);
+  clientConfigs(home);
+  const mixed = "X-" + legacyName.toUpperCase() + "-TOKEN";
+  for (const file of [path.join(home, ".claude.json"), path.join(home, ".codex/config.toml")]) {
+    const before = fs.readFileSync(file, "utf8");
+    const conflict = before
+      .replace("x-" + legacyName + "-token", mixed)
+      .replace("local-test-secret", "conflicting-fixture");
+    fs.writeFileSync(file, conflict);
+    const result = command("migrate", "--check");
+    assert.notEqual(result.status, 0, "Abweichendes Clienttoken wurde akzeptiert");
+    assert.ok(!result.stderr.includes("conflicting-fixture"));
+    assert.equal(fs.readFileSync(file, "utf8"), conflict);
+    assert.ok(fs.existsSync(old));
+    assert.ok(!fs.existsSync(current));
+    fs.writeFileSync(file, before);
+  }
+});
+
+test("Alleiniger alter Tokenheader im bereits umbenannten Server wird wiederhergestellt", (t) => {
+  const { home, old, current, command } = fixture(t);
+  fs.rmSync(old, { recursive: true });
+  const header = "X-" + legacyName.toUpperCase() + "-TOKEN";
+  const server = { url: "http://localhost:7357/mcp/claude", headers: { [header]: "fixture-only" } };
+  const file = path.join(home, ".claude.json");
+  fs.writeFileSync(file, JSON.stringify({ mcpServers: { crewpip: server } }));
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).mcpServers.crewpip.headers, {
+    "x-crewpip-token": "fixture-only",
+  });
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8").trim(), "fixture-only");
+});
+
+test("Ein abweichender Tokenheader im bereits eingerichteten zweiten Client stoppt den Umzug", (t) => {
+  const { old, current, home, command } = fixture(t);
+  clientConfigs(home);
+  fs.rmSync(old, { recursive: true });
+  const file = path.join(home, ".claude.json");
+  const currentServer = {
+    url: "http://localhost:7357/mcp/claude",
+    headers: { "X-CrewPip-Token": "different-fixture" },
+  };
+  const initial = JSON.stringify({ mcpServers: { crewpip: currentServer } });
+  fs.writeFileSync(file, initial);
+  const result = command("migrate", "--check");
+  assert.notEqual(result.status, 0, "Token eines bereits umbenannten Clients wurde übergangen");
+  assert.ok(!result.stderr.includes("different-fixture"));
+  assert.equal(fs.readFileSync(file, "utf8"), initial);
+  assert.ok(!fs.existsSync(current));
+});
+
+test("Konfigurierter Tokenheader aus der Umgebung behält den Variablennamen und überprüft seinen Wert", (t) => {
+  const { env, home, old, current, command } = fixture(t);
+  fs.rmSync(old, { recursive: true });
+  fs.mkdirSync(path.join(home, ".codex"));
+  const file = path.join(home, ".codex/config.toml");
+  const header = "X-" + legacyName.toUpperCase() + "-TOKEN";
+  const text = `[mcp_servers.${legacyName}]\nurl = "http://localhost:7357/mcp/codex"\nenv_http_headers = { "${header}" = "CREWPIP_TEST_TOKEN" }\n`;
+  fs.writeFileSync(file, text);
+  const missing = command("migrate", "--check");
+  assert.notEqual(missing.status, 0);
+  assert.equal(fs.readFileSync(file, "utf8"), text);
+  env.CREWPIP_TEST_TOKEN = "fixture-from-env";
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    parseToml(fs.readFileSync(file, "utf8")).mcp_servers.crewpip.env_http_headers["x-crewpip-token"],
+    "CREWPIP_TEST_TOKEN",
+  );
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8").trim(), env.CREWPIP_TEST_TOKEN);
 });
 
 test("Übernimmt bestätigte Transaktionen aus offenem WAL und prüft die unabhängige Sicherung", (t) => {

@@ -545,7 +545,7 @@ export async function migrateInstallation({ repo, check = false, recover = false
   const before = inventory(dbfile);
   const plist = exists(oldPlist) ? buildPlist(oldPlist, repo, old, current) : null;
   for (const c of changes) configSwap("check", c.file, home);
-  const savedToken = installationToken(changes, hasData ? old : current, plist?.configuredToken);
+  const savedToken = installationToken(home, changes, hasData ? old : current, plist?.configuredToken);
   if (hasData && !savedToken)
     throw new Error("Das Zugangstoken der bisherigen Installation ist nicht eindeutig verfügbar");
   const createsToken = configOnly && !exists(current) && !!savedToken;
@@ -651,7 +651,7 @@ export async function migrateInstallation({ repo, check = false, recover = false
       if (read(change.file) !== change.before) {
         const latest = configChanges(home, repo, legacyName).find((c) => c.file === change.file);
         if (!latest) throw new Error("MCP-/Hook-Eintrag wurde parallel geändert: " + change.file);
-        installationToken([latest], hasData ? old : current, savedToken);
+        installationToken(home, [latest], hasData ? old : current, savedToken);
         change = latest;
         const saved = path.join(backup, "config-" + i + "-latest");
         fs.writeFileSync(saved, change.before, { mode: 0o600 });

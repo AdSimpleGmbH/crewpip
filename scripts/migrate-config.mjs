@@ -7,18 +7,20 @@ import { isDeepStrictEqual as equal } from "node:util";
 import { parse } from "smol-toml";
 import { parseTree, findNodeAtLocation, modify, applyEdits } from "jsonc-parser";
 
-function renameKey(object, before, after, transform = (value) => value) {
-  if (!Object.hasOwn(object, before)) return false;
-  const next = transform(object[before]);
+function renameKey(object, before, after) {
+  const next = object[before];
   if (Object.hasOwn(object, after) && !equal(object[after], next)) {
     throw new Error("Unterschiedliche Einstellungen für denselben CrewPip-Eintrag");
   }
   object[after] = next;
   delete object[before];
-  return true;
 }
 
-function migrateServer(server, old) {
+const tokenHeader = "x-crewpip-token";
+const headerFields = ["headers", "http_headers", "env_http_headers"];
+const matchesToken = (name, old) => [tokenHeader, "x-" + old + "-token"].includes(name.toLowerCase());
+
+function checkLocalServer(server) {
   if (!server || typeof server !== "object" || !server.url)
     throw new Error("Unerwartete lokale MCP-Konfiguration");
   const url = new URL(server.url);
@@ -28,11 +30,33 @@ function migrateServer(server, old) {
     !/^\/mcp\/(claude|codex|cursor)$/.test(url.pathname)
   )
     throw new Error("MCP-Ziel ist kein lokaler CrewPip-Endpunkt");
-  const next = server;
-  for (const key of ["headers", "http_headers", "env_http_headers"]) {
-    if (next[key]) renameKey(next[key], "x-" + old + "-token", "x-crewpip-token");
+}
+
+function migrateServer(server, old, renames) {
+  checkLocalServer(server);
+  for (const field of headerFields) {
+    const headers = server[field];
+    for (const key of Object.keys(headers ?? {})) {
+      if (key === tokenHeader || !matchesToken(key, old)) continue;
+      renameKey(headers, key, tokenHeader);
+      renames?.set(key, tokenHeader);
+    }
   }
-  return next;
+}
+
+function migrateServers(servers, old, renames) {
+  const legacy = servers?.[old];
+  const current = servers?.crewpip;
+  const stale = headerFields.some((field) =>
+    Object.keys(current?.[field] ?? {}).some((key) => key.toLowerCase() === "x-" + old + "-token"),
+  );
+  if (!legacy && !stale) return false;
+  if (current) migrateServer(current, old, renames);
+  if (legacy) {
+    migrateServer(legacy, old, renames);
+    renameKey(servers, old, "crewpip");
+  }
+  return true;
 }
 
 // Die App-Snippets verwenden einen Node-Befehl, einen Skriptpfad und zwei
@@ -112,7 +136,7 @@ function jsonEdits(source, before, after, keys) {
           continue;
         }
         const renamed = keys.get(key);
-        if (renamed && Object.hasOwn(next, renamed) && !Object.hasOwn(previous, renamed)) {
+        if (renamed && Object.hasOwn(next, renamed) && !locate([...parts, renamed])) {
           replace(locate([...parts, key]).parent.children[0], renamed);
           visit(value, next[renamed], [...parts, renamed]);
         } else {
@@ -135,7 +159,8 @@ function jsonEdits(source, before, after, keys) {
 function jsonConfig(source, old, repo) {
   const doc = JSON.parse(source);
   const before = structuredClone(doc);
-  if (doc.mcpServers) renameKey(doc.mcpServers, old, "crewpip", (s) => migrateServer(s, old));
+  const renames = new Map([[old, "crewpip"]]);
+  migrateServers(doc.mcpServers, old, renames);
   if (doc.hooks) migrateHooks(doc.hooks, old, repo);
   if (doc.permissions) {
     const previousPrefix = "mcp__" + old;
@@ -169,15 +194,24 @@ function jsonConfig(source, old, repo) {
     if (JSON.stringify(doc.permissions).includes(previousPrefix))
       throw new Error("Angepasste Werkzeugregel einzeln prüfen");
   }
-  return jsonEdits(
-    source,
-    before,
-    doc,
-    new Map([
-      [old, "crewpip"],
-      ["x-" + old + "-token", "x-crewpip-token"],
-    ]),
-  );
+  return jsonEdits(source, before, doc, renames);
+}
+
+// Inline-Header sind Stringzuweisungen. Nur die Trennkommas außerhalb der
+// Anführungszeichen teilen, damit Werte, Leerraum und fremde Header intakt bleiben.
+function inlineHeaders(body, edit) {
+  const fields = [];
+  let start = 0;
+  for (const token of body.matchAll(/"(?:\\.|[^"\\])*"|'[^']*'|,/g)) {
+    if (token[0] !== ",") continue;
+    fields.push(body.slice(start, token.index));
+    start = token.index + 1;
+  }
+  fields.push(body.slice(start));
+  return fields
+    .map(edit)
+    .filter((field) => field !== null)
+    .join(",");
 }
 
 function tomlConfig(source, old) {
@@ -186,34 +220,52 @@ function tomlConfig(source, old) {
     if (JSON.stringify(doc).includes("mcp__" + old + "__"))
       throw new Error("Angepasste Codex-Werkzeugkennung vor dem Umzug prüfen");
   }
-  if (!doc.mcp_servers?.[old]) {
-    checkOverrides(doc);
-    return source;
-  }
-  const duplicate = Object.hasOwn(doc.mcp_servers, "crewpip");
-  renameKey(doc.mcp_servers, old, "crewpip", (s) => migrateServer(s, old));
+  const duplicate = !!doc.mcp_servers?.[old] && !!doc.mcp_servers?.crewpip;
+  const changed = migrateServers(doc.mcp_servers, old);
   checkOverrides(doc);
+  if (!changed) return source;
+  const seen = new Set();
+  let server;
+  let subtable;
+  function editHeader(assignment, field) {
+    const match = /^(\s*)(["']?)([\w-]+)\2(?=\s*=)/.exec(assignment);
+    if (!match || !matchesToken(match[3], old)) return assignment;
+    if (seen.has(field)) return null;
+    seen.add(field);
+    return match[1] + match[2] + tokenHeader + match[2] + assignment.slice(match[0].length);
+  }
+  function commentLine(line) {
+    const comment = [...line.matchAll(/"(?:\\.|[^"\\])*"|'[^']*'|#.*$/gm)].find((token) => token[0][0] === "#");
+    return comment ? line.slice(comment.index) : "";
+  }
   const lines = source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-  let inside = false;
   const result = lines
     .map((line) => {
       if (/^\s*\[/.test(line)) {
-        const header =
-          /^\s*\[\s*(?:"mcp_servers"|'mcp_servers'|mcp_servers)\s*\.\s*(?:"([^"]+)"|'([^']+)'|([\w-]+))\s*(?:\.|\])/.exec(
+        const section =
+          /^(\s*\[\s*(?:"mcp_servers"|'mcp_servers'|mcp_servers)\s*\.\s*)(["']?)([\w-]+)\2\s*([^\]]*)\]/.exec(
             line,
           );
-        inside = !!header && (header[1] ?? header[2] ?? header[3]) === old;
-        if (inside && !duplicate) return line.replace(old, "crewpip");
+        server = section?.[3];
+        subtable = section?.[4].trim();
+        if (server === old && !duplicate)
+          return line.replace(section[1] + section[2] + old, section[1] + section[2] + "crewpip");
       }
-      if (!inside) return line;
-      if (duplicate) return line.trimStart().startsWith("#") ? line : "";
-      if (/^\s*["']?(?:http_headers|env_http_headers)["']?\s*=\s*\{/.test(line)) {
-        const field = new RegExp("([,{]\\s*)([\"']?)x-" + old + "-token\\2(?=\\s*=)", "g");
-        return line.replace(field, "$1$2x-crewpip-token$2");
+      if (server !== old && server !== "crewpip") return line;
+      if (server === old && duplicate) return commentLine(line);
+      const headerTable = /^\.\s*["']?(http_headers|env_http_headers)["']?$/.exec(subtable);
+      if (headerTable) {
+        return editHeader(line, headerTable[1]) ?? commentLine(line);
       }
-      return line.replace(/^(\s*["']?)([\w-]+)(["']?\s*=)/, (whole, start, key, end) =>
-        key === "x-" + old + "-token" ? start + "x-crewpip-token" + end : whole,
-      );
+      if (!subtable) {
+        const inline =
+          /^(\s*["']?(http_headers|env_http_headers)["']?\s*=\s*\{)((?:"(?:\\.|[^"\\])*"|'[^']*'|[^}"'])*)(\}[^\S\n]*(?:#.*)?\r?\n?)$/.exec(
+            line,
+          );
+        if (inline)
+          return inline[1] + inlineHeaders(inline[3], (field) => editHeader(field, inline[2])) + inline[4];
+      }
+      return line;
     })
     .join("");
   // Nur anwenden, wenn die vollständige TOML-Datenstruktur dem geplanten Ergebnis entspricht.
@@ -229,7 +281,7 @@ export function configChanges(home, repo, old) {
   for (const file of files) {
     if (!fs.existsSync(file)) continue;
     const before = fs.readFileSync(file, "utf8");
-    if (!before.includes(old)) continue;
+    if (!before.toLowerCase().includes(old)) continue;
     try {
       const after = file.endsWith(".toml") ? tomlConfig(before, old) : jsonConfig(before, old, repo);
       if (before !== after) {
@@ -247,17 +299,35 @@ export function configChanges(home, repo, old) {
 // Nur die Token-Header der beteiligten lokalen MCP-Einträge vergleichen. Bei einer
 // Installation mit ausschließlich gespeicherter Clientkonfiguration kann so derselbe
 // Zugang beim ersten Dienststart weiterverwendet werden.
-export function installationToken(changes, dir, expected) {
+export function installationToken(home, changes, dir, expected) {
   const tokens = new Set();
   if (expected) tokens.add(expected);
   const tokenFile = path.join(dir, "token");
   if (fs.existsSync(tokenFile)) tokens.add(fs.readFileSync(tokenFile, "utf8").trim());
-  for (const { file, after } of changes) {
-    const server = file.endsWith(".toml")
-      ? parse(after).mcp_servers?.crewpip
-      : JSON.parse(after).mcpServers?.crewpip;
-    const token = server?.http_headers?.["x-crewpip-token"] ?? server?.headers?.["x-crewpip-token"];
-    if (token) tokens.add(token);
+  const sources = new Map(changes.map(({ file, after }) => [file, after]));
+  for (const relative of [".claude.json", ".codex/config.toml"]) {
+    const file = path.join(home, relative);
+    if (!sources.has(file) && fs.existsSync(file)) sources.set(file, fs.readFileSync(file, "utf8"));
+  }
+  for (const [file, source] of sources) {
+    try {
+      const server = file.endsWith(".toml")
+        ? parse(source).mcp_servers?.crewpip
+        : JSON.parse(source).mcpServers?.crewpip;
+      for (const field of headerFields) {
+        for (const [name, value] of Object.entries(server?.[field] ?? {})) {
+          if (name.toLowerCase() !== tokenHeader) continue;
+          checkLocalServer(server);
+          const token = field === "env_http_headers" ? process.env[value] : value;
+          if (typeof token !== "string" || !token.trim() || (field === "headers" && /\$\{[^}]+\}/.test(token)))
+            throw new Error();
+          tokens.add(token);
+        }
+      }
+    } catch {
+      // Weder Parserfehler noch Headerwerte aus den privaten Konfigurationen ausgeben.
+      throw new Error("Lokales MCP-Token nicht eindeutig bestimmbar: " + file);
+    }
   }
   if (tokens.size > 1)
     throw new Error("Lokale Token stimmen nicht überein. Getrennte Installationen vor dem Umzug prüfen.");
