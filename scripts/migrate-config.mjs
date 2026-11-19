@@ -32,8 +32,11 @@ function checkLocalServer(server) {
     throw new Error("MCP-Ziel ist kein lokaler CrewPip-Endpunkt");
 }
 
-function migrateServer(server, old, renames) {
+function migrateServer(server, old, renames, renamedEnv) {
   checkLocalServer(server);
+  for (const [key, source] of Object.entries(server.env_http_headers ?? {})) {
+    if (renamedEnv?.has(source)) server.env_http_headers[key] = renamedEnv.get(source);
+  }
   for (const field of headerFields) {
     const headers = server[field];
     for (const key of Object.keys(headers ?? {})) {
@@ -42,18 +45,23 @@ function migrateServer(server, old, renames) {
       renames?.set(key, tokenHeader);
     }
   }
+  if (renamedEnv?.has(server.bearer_token_env_var))
+    server.bearer_token_env_var = renamedEnv.get(server.bearer_token_env_var);
 }
 
-function migrateServers(servers, old, renames) {
+function migrateServers(servers, old, renames, renamedEnv) {
   const legacy = servers?.[old];
   const current = servers?.crewpip;
   const stale = headerFields.some((field) =>
     Object.keys(current?.[field] ?? {}).some((key) => key.toLowerCase() === "x-" + old + "-token"),
   );
-  if (!legacy && !stale) return false;
-  if (current) migrateServer(current, old, renames);
+  const movedSource =
+    renamedEnv?.has(current?.bearer_token_env_var) ||
+    Object.values(current?.env_http_headers ?? {}).some((name) => renamedEnv?.has(name));
+  if (!legacy && !stale && !movedSource) return false;
+  if (current) migrateServer(current, old, renames, renamedEnv);
   if (legacy) {
-    migrateServer(legacy, old, renames);
+    migrateServer(legacy, old, renames, renamedEnv);
     renameKey(servers, old, "crewpip");
   }
   return true;
@@ -214,20 +222,28 @@ function inlineHeaders(body, edit) {
     .join(",");
 }
 
-function tomlConfig(source, old) {
+function tomlConfig(source, old, renamedEnv) {
   const doc = parse(source);
   function checkOverrides(doc) {
     if (JSON.stringify(doc).includes("mcp__" + old + "__"))
       throw new Error("Angepasste Codex-Werkzeugkennung vor dem Umzug prüfen");
   }
   const duplicate = !!doc.mcp_servers?.[old] && !!doc.mcp_servers?.crewpip;
-  const changed = migrateServers(doc.mcp_servers, old);
+  const changed = migrateServers(doc.mcp_servers, old, undefined, renamedEnv);
   checkOverrides(doc);
   if (!changed) return source;
   const seen = new Set();
   let server;
   let subtable;
+  function editEnvValue(assignment) {
+    return assignment.replace(
+      /^(\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|[\w-]+)\s*=\s*)(["'])([^"']+)\2/,
+      (whole, prefix, quote, value) =>
+        renamedEnv?.has(value) ? prefix + quote + renamedEnv.get(value) + quote : whole,
+    );
+  }
   function editHeader(assignment, field) {
+    if (field === "env_http_headers") assignment = editEnvValue(assignment);
     const match = /^(\s*)(["']?)([\w-]+)\2(?=\s*=)/.exec(assignment);
     if (!match || !matchesToken(match[3], old)) return assignment;
     if (seen.has(field)) return null;
@@ -258,6 +274,7 @@ function tomlConfig(source, old) {
         return editHeader(line, headerTable[1]) ?? commentLine(line);
       }
       if (!subtable) {
+        if (/^\s*["']?bearer_token_env_var["']?\s*=/.test(line)) return editEnvValue(line);
         const inline =
           /^(\s*["']?(http_headers|env_http_headers)["']?\s*=\s*\{)((?:"(?:\\.|[^"\\])*"|'[^']*'|[^}"'])*)(\}[^\S\n]*(?:#.*)?\r?\n?)$/.exec(
             line,
@@ -273,7 +290,7 @@ function tomlConfig(source, old) {
   return result;
 }
 
-export function configChanges(home, repo, old) {
+export function configChanges(home, repo, old, renamedEnv) {
   const files = [".claude.json", ".claude/settings.json", ".codex/config.toml", ".codex/hooks.json"].map((f) =>
     path.join(home, f),
   );
@@ -283,7 +300,7 @@ export function configChanges(home, repo, old) {
     const before = fs.readFileSync(file, "utf8");
     if (!before.toLowerCase().includes(old)) continue;
     try {
-      const after = file.endsWith(".toml") ? tomlConfig(before, old) : jsonConfig(before, old, repo);
+      const after = file.endsWith(".toml") ? tomlConfig(before, old, renamedEnv) : jsonConfig(before, old, repo);
       if (before !== after) {
         if (!fs.lstatSync(file).isFile()) throw new Error("Verknüpfte Konfiguration bitte am Ziel überprüfen");
         changes.push({ file, before, after, mode: fs.statSync(file).mode & 0o777 });
@@ -296,10 +313,65 @@ export function configChanges(home, repo, old) {
   return changes;
 }
 
+// Nur ausdrücklich referenzierte Auth-Variablen des lokalen MCP-Servers lesen.
+function environmentValues(name, plist) {
+  if (typeof name !== "string" || !name) throw new Error();
+  const values = new Set();
+  if (Object.hasOwn(plist?.environment ?? {}, name)) values.add(plist.environment[name]);
+  if (Object.hasOwn(process.env, name)) values.add(process.env[name]);
+  for (const [before, after] of plist?.renamedEnv ?? []) {
+    if (after === name && Object.hasOwn(process.env, before)) values.add(process.env[before]);
+  }
+  if (!values.size) throw new Error();
+  return [...values];
+}
+
+function clientTokens(server, codex, plist) {
+  if (!server) return [];
+  const fields = codex ? ["http_headers", "env_http_headers"] : ["headers"];
+  function headers(name) {
+    const headers = [];
+    for (const field of fields) {
+      for (const [key, value] of Object.entries(server[field] ?? {})) {
+        if (key.toLowerCase() !== name) continue;
+        checkLocalServer(server);
+        const values = field === "env_http_headers" ? environmentValues(value, plist) : [value];
+        for (const raw of values) {
+          if (typeof raw !== "string" || (!codex && /\$\{[^}]+\}/.test(raw))) throw new Error();
+          // Gleiche Normalisierung und Prüfung wie beim Aufbau eines HTTP-Headers.
+          headers.push(new Headers([[name, raw]]).get(name));
+        }
+      }
+    }
+    return headers;
+  }
+  // tokenFromRequest nimmt zuerst den Produkttoken-Header. Fremde oder
+  // nachrangige Authorization-Quellen in diesem Fall gar nicht auflösen.
+  const primary = headers(tokenHeader);
+  if (primary.some(Boolean)) {
+    const tokens = primary.map((value) => value.trim());
+    if (tokens.some((token) => !token)) throw new Error();
+    return tokens;
+  }
+  const tokens = headers("authorization").map((header) => {
+    if (!header.toLowerCase().startsWith("bearer ")) throw new Error();
+    return header.slice(7).trim();
+  });
+  if (codex && Object.hasOwn(server, "bearer_token_env_var")) {
+    checkLocalServer(server);
+    for (const value of environmentValues(server.bearer_token_env_var, plist)) {
+      const header = new Headers([["authorization", "Bearer " + value]]).get("authorization");
+      tokens.push(header.slice(7).trim());
+    }
+  }
+  if (tokens.some((token) => !token) || (primary.length && !tokens.length)) throw new Error();
+  return tokens;
+}
+
 // Nur die Token-Header der beteiligten lokalen MCP-Einträge vergleichen. Bei einer
 // Installation mit ausschließlich gespeicherter Clientkonfiguration kann so derselbe
 // Zugang beim ersten Dienststart weiterverwendet werden.
-export function installationToken(home, changes, dir, expected) {
+export function installationToken(home, changes, dir, plist, expected = plist?.configuredToken) {
   const tokens = new Set();
   if (expected) tokens.add(expected);
   const tokenFile = path.join(dir, "token");
@@ -311,19 +383,9 @@ export function installationToken(home, changes, dir, expected) {
   }
   for (const [file, source] of sources) {
     try {
-      const server = file.endsWith(".toml")
-        ? parse(source).mcp_servers?.crewpip
-        : JSON.parse(source).mcpServers?.crewpip;
-      for (const field of headerFields) {
-        for (const [name, value] of Object.entries(server?.[field] ?? {})) {
-          if (name.toLowerCase() !== tokenHeader) continue;
-          checkLocalServer(server);
-          const configured = field === "env_http_headers" ? process.env[value] : value;
-          const token = typeof configured === "string" && configured.trim();
-          if (!token || (field === "headers" && /\$\{[^}]+\}/.test(token))) throw new Error();
-          tokens.add(token);
-        }
-      }
+      const codex = file.endsWith(".toml");
+      const server = codex ? parse(source).mcp_servers?.crewpip : JSON.parse(source).mcpServers?.crewpip;
+      for (const token of clientTokens(server, codex, plist)) tokens.add(token);
     } catch {
       // Weder Parserfehler noch Headerwerte aus den privaten Konfigurationen ausgeben.
       throw new Error("Lokales MCP-Token nicht eindeutig bestimmbar: " + file);

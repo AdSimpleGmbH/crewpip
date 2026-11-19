@@ -363,6 +363,187 @@ test("Konfigurierter Tokenheader aus der Umgebung behält den Variablennamen und
   assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "fixture-from-env\n");
 });
 
+function builtServiceFixture(home) {
+  const repo = path.join(home, "service-fixture");
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "apps/daemon/dist"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "apps/daemon/dist/index.js"), "");
+  for (const name of [
+    "service.mjs",
+    "service-runtime.mjs",
+    "migration.mjs",
+    "migrate-config.mjs",
+    "swap-config.py",
+  ]) {
+    fs.copyFileSync(path.join(path.dirname(service), name), path.join(repo, "scripts", name));
+  }
+  fs.symlinkSync(path.resolve(path.dirname(service), "../node_modules"), path.join(repo, "node_modules"));
+  return repo;
+}
+
+// Der Testprozess erbt ausschließlich die angegebene Fixture-Umgebung. Im
+// selben Prozess laufen der echte MCP-Endpunkt und die Anfrage aus dem Client-Eintrag.
+function checkMcp(home, app, childEnv = {}) {
+  const result = spawnSync(
+    process.execPath,
+    ["--import", "tsx", fileURLToPath(new URL("./mcp-initialize.mjs", import.meta.url)), app],
+    {
+      cwd: path.resolve(path.dirname(service), "../apps/daemon"),
+      env: { ...childEnv, HOME: home, TMPDIR: path.dirname(home), PATH: "/usr/bin:/bin" },
+      encoding: "utf8",
+      timeout: 15000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+}
+
+for (const style of ["Header", "Bearer-Variable", "Authorization-Variable"]) {
+  test(`LaunchAgent-Tokenquelle bleibt nach dem Umzug für den Codex-Runner erreichbar (${style})`, async (t) => {
+    const { home, old, current, env } = fixture(t);
+    const repo = builtServiceFixture(home);
+    const command = (action = "migrate", ...args) =>
+      spawnSync(process.execPath, [path.join(repo, "scripts/service.mjs"), action, ...args], {
+        env,
+        encoding: "utf8",
+      });
+    const previous = legacyName.toUpperCase() + (style === "Header" ? "_TOKEN" : "_CLIENT_KEY");
+    const key = style === "Header" ? "CREWPIP_TOKEN" : "CREWPIP_CLIENT_KEY";
+    const value = style === "Authorization-Variable" ? "Bearer local-test-secret" : "local-test-secret";
+    const agents = path.join(home, "Library/LaunchAgents");
+    fs.mkdirSync(agents, { recursive: true });
+    fs.writeFileSync(
+      path.join(home, "bin/launchctl"),
+      '#!/bin/sh\nif [ "$1" = getenv ]; then exit 1; fi\necho "Could not find service" >&2; exit 113\n',
+      { mode: 0o700 },
+    );
+    const oldPlist = path.join(agents, oldLabel + ".plist");
+    fs.writeFileSync(
+      oldPlist,
+      JSON.stringify({
+        Label: oldLabel,
+        ProgramArguments: [process.execPath, path.join(repo, "apps/daemon/dist/index.js")],
+        EnvironmentVariables: { [previous]: value, [legacyName.toUpperCase() + "_META"]: "fixture-metadata" },
+      }),
+    );
+    const file = path.join(home, ".codex/config.toml");
+    fs.mkdirSync(path.dirname(file));
+    const section = "[mcp_servers." + legacyName + "]";
+    const own =
+      style === "Header"
+        ? "env_http_headers = { 'X-" +
+          legacyName +
+          "-Token' = '" +
+          previous +
+          "', 'X-Unrelated' = 'PRIVATE_OTHER', 'X.Meta' = '" +
+          legacyName.toUpperCase() +
+          "_META' }"
+        : style === "Bearer-Variable"
+          ? "bearer_token_env_var = '" + previous + "'"
+          : section.replace("]", ".env_http_headers]") + "\nAuthorization = '" + previous + "'";
+    const foreign = "[mcp_servers.other.env_http_headers]\nAuthorization = '" + previous + "' # unrelated\n";
+    fs.writeFileSync(file, section + '\nurl="http://localhost:7357/mcp/codex"\n' + own + " # keep\n" + foreign);
+    // Eine Migration aus der Shell kann die Quelle kennen. Der gestartete Runner
+    // erhält danach ausschließlich die endgültige Plist.
+    if (style === "Header") env[previous] = value;
+    await t.test("Konflikt vor der ersten Änderung", () => {
+      const before = fs.readFileSync(file, "utf8");
+      env[key] = "conflicting-fixture";
+      const conflict = command("migrate", "--check");
+      assert.notEqual(conflict.status, 0, "Abweichende künftige Clientquelle wurde akzeptiert");
+      assert.equal(fs.readFileSync(file, "utf8"), before);
+      assert.ok(fs.existsSync(oldPlist) && fs.existsSync(old) && !fs.existsSync(current));
+    });
+    delete env[key];
+    const result = command();
+    assert.equal(result.status, 0, result.stderr);
+    const text = fs.readFileSync(file, "utf8");
+    assert.ok(text.endsWith(foreign));
+    const plist = JSON.parse(
+      execFileSync("plutil", ["-convert", "json", "-o", "-", path.join(agents, "crewpip.plist")]),
+    );
+    checkMcp(home, "codex", plist.EnvironmentVariables);
+    const server = parseToml(text).mcp_servers.crewpip;
+    assert.equal(
+      style === "Bearer-Variable"
+        ? server.bearer_token_env_var
+        : server.env_http_headers[style === "Header" ? "x-crewpip-token" : "Authorization"],
+      key,
+    );
+    if (style === "Header") {
+      assert.equal(server.env_http_headers["X-Unrelated"], "PRIVATE_OTHER");
+      assert.equal(server.env_http_headers["X.Meta"], "CREWPIP_META");
+    }
+    assert.equal(command().status, 0);
+    assert.equal(fs.readFileSync(file, "utf8"), text);
+  });
+}
+
+for (const app of ["claude", "codex"]) {
+  test(`Statischer Bearer-Zugang ohne Datenordner übersteht den ersten Dienststart (${app})`, (t) => {
+    const { home, old, current, command } = fixture(t);
+    fs.rmSync(old, { recursive: true });
+    const url = "http://localhost:7357/mcp/" + app;
+    const auth = " bEaReR  fixture-from-bearer  ";
+    if (app === "claude") {
+      fs.writeFileSync(
+        path.join(home, ".claude.json"),
+        JSON.stringify({
+          mcpServers: { [legacyName]: { url, headers: { aUtHoRiZaTiOn: auth, Other: "retain" } } },
+        }),
+      );
+    } else {
+      fs.mkdirSync(path.join(home, ".codex"));
+      fs.writeFileSync(
+        path.join(home, ".codex/config.toml"),
+        `[mcp_servers.${legacyName}]\nurl = "${url}"\nhttp_headers = { AUTHORIZATION = "${auth}", Other = "retain" }\n`,
+      );
+    }
+    const result = command();
+    assert.equal(result.status, 0, result.stderr);
+    checkMcp(home, app);
+    assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "fixture-from-bearer\n");
+    assert.equal(command().status, 0);
+  });
+}
+
+test("Der Produkttoken hat vor weiteren Authorization-Quellen desselben Clients Vorrang", (t) => {
+  const { home, old, current, command } = fixture(t);
+  fs.rmSync(old, { recursive: true });
+  fs.mkdirSync(path.join(home, ".codex"));
+  const file = path.join(home, ".codex/config.toml");
+  const foreign =
+    "[mcp_servers.other]\nurl = 'https://example.invalid/mcp/codex'\nbearer_token_env_var = 'FOREIGN_SECRET'\n";
+  fs.writeFileSync(
+    file,
+    `[mcp_servers.${legacyName}]\nurl = 'http://localhost:7357/mcp/codex'\nhttp_headers = { 'x-${legacyName}-token' = 'fixture-primary', Authorization = 'Basic unused' }\nbearer_token_env_var = 'PRIVATE_UNUSED'\n` +
+      foreign,
+  );
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "fixture-primary\n");
+  assert.ok(fs.readFileSync(file, "utf8").endsWith(foreign));
+  checkMcp(home, "codex", { PRIVATE_UNUSED: "ignored-fixture" });
+});
+
+test("Externe Bearer-Variable behält ihren Namen und muss zum lokalen Token passen", (t) => {
+  const { home, old, current, env, command } = fixture(t);
+  fs.mkdirSync(path.join(home, ".codex"));
+  const file = path.join(home, ".codex/config.toml");
+  const text = `[mcp_servers.${legacyName}]\nurl='http://localhost:7357/mcp/codex'\nbearer_token_env_var = 'PRIVATE_BOARD_ACCESS' # keep\n`;
+  fs.writeFileSync(file, text);
+  env.PRIVATE_BOARD_ACCESS = "different-fixture";
+  const conflict = command("migrate", "--check");
+  assert.notEqual(conflict.status, 0);
+  assert.ok(!conflict.stderr.includes(env.PRIVATE_BOARD_ACCESS));
+  assert.equal(fs.readFileSync(file, "utf8"), text);
+  assert.ok(fs.existsSync(old) && !fs.existsSync(current));
+  env.PRIVATE_BOARD_ACCESS = "local-test-secret";
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(file, "utf8"), text.replace(legacyName, "crewpip"));
+  checkMcp(home, "codex", { PRIVATE_BOARD_ACCESS: env.PRIVATE_BOARD_ACCESS });
+});
+
 test("Übernimmt bestätigte Transaktionen aus offenem WAL und prüft die unabhängige Sicherung", (t) => {
   const { home, old, current, command } = fixture(t);
   const file = path.join(old, legacyName + ".db");
@@ -411,20 +592,7 @@ test("Ein fehlgeschlagener neuer Login-Dienst stellt Dateien und echte Worktrees
   const agents = path.join(home, "Library/LaunchAgents");
   fs.mkdirSync(agents, { recursive: true });
   const previous = oldLabel;
-  const repo = path.join(home, "service-fixture");
-  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  fs.mkdirSync(path.join(repo, "apps/daemon/dist"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "apps/daemon/dist/index.js"), "");
-  for (const name of [
-    "service.mjs",
-    "service-runtime.mjs",
-    "migration.mjs",
-    "migrate-config.mjs",
-    "swap-config.py",
-  ]) {
-    fs.copyFileSync(path.join(path.dirname(service), name), path.join(repo, "scripts", name));
-  }
-  fs.symlinkSync(path.resolve(path.dirname(service), "../node_modules"), path.join(repo, "node_modules"));
+  const repo = builtServiceFixture(home);
   const plist = path.join(agents, previous + ".plist");
   const xml = execFileSync("plutil", ["-convert", "xml1", "-o", "-", "--", "-"], {
     input: JSON.stringify({

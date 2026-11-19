@@ -103,6 +103,7 @@ function buildPlist(file, repo, old, current) {
     if (doc[k]?.startsWith(old + "/")) doc[k] = current + doc[k].slice(old.length);
   const env = doc.EnvironmentVariables ?? {};
   if (runtime.searchPath !== undefined) env.PATH = runtime.searchPath;
+  const renamedEnv = new Map();
   const prefix = legacyName.toUpperCase() + "_";
   if (env[prefix + "DB"] && env[prefix + "DB"] !== path.join(old, oldDb))
     throw new Error("Externen Datenbankpfad vor dem Umzug prüfen");
@@ -116,6 +117,7 @@ function buildPlist(file, repo, old, current) {
     else if (value.startsWith(old + "/")) value = current + value.slice(old.length);
     if (Object.hasOwn(env, target) && env[target] !== value)
       throw new Error("Widersprüchliche Dienstvariable " + target);
+    renamedEnv.set(key, target);
     env[target] = value;
     delete env[key];
   }
@@ -160,13 +162,15 @@ function buildPlist(file, repo, old, current) {
     configuredToken = read(source).trim();
     if (!configuredToken) throw new Error("Konfigurierte Tokendatei ist leer");
   }
-  // Ein privates kanonisches Token dient danach dem Daemon, den Hooks und der Dienstprüfung.
-  delete env.CREWPIP_TOKEN;
-  delete env.CREWPIP_TOKEN_FILE;
+  // Runner-Kindprozesse erben die ausdrücklich vereinbarte Tokenquelle.
+  // Dateibasierte Zugänge verwenden die zusammen mit den Daten gesicherte Datei.
+  if (env.CREWPIP_TOKEN_FILE) env.CREWPIP_TOKEN_FILE = path.join(current, "token");
   doc.EnvironmentVariables = env;
   return {
     tokenFile: path.join(current, "token"),
     configuredToken,
+    renamedEnv,
+    environment: env,
     bytes: execFileSync("plutil", ["-convert", "xml1", "-o", "-", "--", "-"], {
       input: JSON.stringify(doc),
       stdio: ["pipe", "pipe", "pipe"],
@@ -518,11 +522,6 @@ export async function migrateInstallation({ repo, check = false, recover = false
   if (wasLoaded && !managedPid) throw new Error("PID des bisherigen Login-Dienstes konnte nicht bestimmt werden");
   const hasData = exists(old);
   const configOnly = !hasData && !exists(oldPlist) && !wasLoaded;
-  const changes = configChanges(home, repo, legacyName);
-  if (configOnly && !changes.length) {
-    console.log("Kein Bestandsumzug erforderlich.");
-    return;
-  }
   if (!configOnly && (exists(current) || exists(newPlist) || loaded(label)))
     throw new Error("Alte und neue Installation sind gleichzeitig vorhanden. Bestände vor dem Umzug abgleichen.");
   if (!configOnly && (!hasData || !fs.lstatSync(old).isDirectory()))
@@ -540,8 +539,13 @@ export async function migrateInstallation({ repo, check = false, recover = false
     throw new Error("Zieldatenbank oder Sidecardatei im bisherigen Datenordner bereits belegt");
   const before = inventory(dbfile);
   const plist = exists(oldPlist) ? buildPlist(oldPlist, repo, old, current) : null;
+  const changes = configChanges(home, repo, legacyName, plist?.renamedEnv);
+  if (configOnly && !changes.length) {
+    console.log("Kein Bestandsumzug erforderlich.");
+    return;
+  }
   for (const c of changes) configSwap("check", c.file, home);
-  const savedToken = installationToken(home, changes, hasData ? old : current, plist?.configuredToken);
+  const savedToken = installationToken(home, changes, hasData ? old : current, plist);
   if (hasData && !savedToken)
     throw new Error("Das Zugangstoken der bisherigen Installation ist nicht eindeutig verfügbar");
   const createsToken = configOnly && !exists(current) && !!savedToken;
@@ -644,9 +648,11 @@ export async function migrateInstallation({ repo, check = false, recover = false
     for (const [i, initial] of changes.entries()) {
       let change = initial;
       if (read(change.file) !== change.before) {
-        const latest = configChanges(home, repo, legacyName).find((c) => c.file === change.file);
+        const latest = configChanges(home, repo, legacyName, plist?.renamedEnv).find(
+          (c) => c.file === change.file,
+        );
         if (!latest) throw new Error("MCP-/Hook-Eintrag wurde parallel geändert: " + change.file);
-        installationToken(home, [latest], hasData ? old : current, savedToken);
+        installationToken(home, [latest], hasData ? old : current, plist, savedToken);
         change = latest;
         const saved = path.join(backup, "config-" + i + "-latest");
         fs.writeFileSync(saved, change.before, { mode: 0o600 });
