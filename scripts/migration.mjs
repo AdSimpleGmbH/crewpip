@@ -191,6 +191,35 @@ function hasTable(db, table) {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
 }
 
+// Bei historischen CWDs kann ein Unterverzeichnis inzwischen gelöscht sein.
+// In diesem Fall den vorhandenen Vorfahren physisch auflösen und den Rest anhängen.
+function resolveStoredPath(stored) {
+  const tail = [];
+  let parent = stored;
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync.native(parent), ...tail.reverse());
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+      const next = path.dirname(parent);
+      if (next === parent) return stored;
+      tail.push(path.basename(parent));
+      parent = next;
+    }
+  }
+}
+
+function relocatedCwd(cwd, trees) {
+  if (!trees.length || !path.isAbsolute(cwd)) return cwd;
+  function replacePrefix(value) {
+    const tree = trees.find(({ old }) => value === old || value.startsWith(old + path.sep));
+    return tree && tree.current + value.slice(tree.old.length);
+  }
+  // Auch ein Symlink innerhalb des Worktrees wird mit ihm verschoben. Deshalb
+  // zuerst den gespeicherten Pfad prüfen, anschließend externe Aliase auflösen.
+  return replacePrefix(cwd) ?? replacePrefix(resolveStoredPath(cwd)) ?? cwd;
+}
+
 function inventory(dbfile) {
   if (!exists(dbfile)) return { projects: [], trees: [] };
   return withDb(dbfile, true, (db) => {
@@ -231,19 +260,21 @@ function inventory(dbfile) {
         }
         const nextBranch = "crewpip/" + branch.slice(legacyName.length + 1);
         if (ref(root, nextBranch)) throw new Error("Zielbranch existiert: " + nextBranch);
-        if (
-          hasTable(db, "sessions") &&
-          db
-            .prepare("PRAGMA table_info(sessions)")
-            .all()
-            .some((c) => c.name === "ended_at") &&
-          db
-            .prepare("SELECT 1 FROM sessions WHERE ended_at IS NULL AND (cwd=? OR substr(cwd,1,?)=?) LIMIT 1")
-            .get(old, old.length + 1, old + "/")
-        ) {
-          throw new Error("Ein geöffneter Chat verwendet den umzuziehenden Worktree: " + old);
-        }
         trees.push({ root, old, current, branch, nextBranch });
+      }
+    }
+    if (
+      trees.length &&
+      hasTable(db, "sessions") &&
+      db
+        .prepare("PRAGMA table_info(sessions)")
+        .all()
+        .some((c) => c.name === "ended_at")
+    ) {
+      const open = db.prepare("SELECT DISTINCT cwd FROM sessions WHERE ended_at IS NULL").all();
+      for (const { cwd } of open) {
+        if (relocatedCwd(cwd, trees) !== cwd)
+          throw new Error("Ein geöffneter Chat verwendet den umzuziehenden Worktree: " + cwd);
       }
     }
     return { projects, trees };
@@ -269,17 +300,21 @@ function updateData(dir, old, current, trees) {
   if (!exists(dbfile)) return;
   withDb(dbfile, false, (db) => {
     db.exec("BEGIN IMMEDIATE");
-    function changePath(table, col, before, after) {
-      if (!hasTable(db, table)) return;
-      db.prepare(
-        `UPDATE ${table} SET ${col}=? || substr(${col},length(?)+1) WHERE ${col}=? OR substr(${col},1,length(?)+1)=? || '/'`,
-      ).run(after, before, before, before, before);
-    }
     try {
-      changePath("runs", "log_path", old, current);
+      if (hasTable(db, "runs")) {
+        db.prepare(
+          "UPDATE runs SET log_path=? || substr(log_path,length(?)+1) WHERE log_path=? OR substr(log_path,1,length(?)+1)=? || '/'",
+        ).run(current, old, old, old, old);
+      }
+      for (const table of ["sessions", "runs"]) {
+        if (!trees.length || !hasTable(db, table)) continue;
+        const update = db.prepare(`UPDATE ${table} SET cwd=? WHERE cwd=?`);
+        for (const { cwd } of db.prepare(`SELECT DISTINCT cwd FROM ${table}`).all()) {
+          const relocated = relocatedCwd(cwd, trees);
+          if (relocated !== cwd) update.run(relocated, cwd);
+        }
+      }
       for (const tree of trees) {
-        changePath("sessions", "cwd", tree.old, tree.current);
-        changePath("runs", "cwd", tree.old, tree.current);
         db.prepare("UPDATE tasks SET worktree_path=?,worktree_branch=? WHERE worktree_path=?").run(
           tree.current,
           tree.nextBranch,

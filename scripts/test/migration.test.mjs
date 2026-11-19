@@ -10,7 +10,7 @@ import { legacyName, oldLabel } from "../migration.mjs";
 
 const service = fileURLToPath(new URL("../service.mjs", import.meta.url));
 
-function fixture(t) {
+function fixture(t, projectName = "project") {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-upgrade-")));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const old = path.join(home, "." + legacyName);
@@ -26,7 +26,7 @@ function fixture(t) {
     '#!/bin/sh\nif [ "$1" = print ]; then echo "Could not find service" >&2; exit 113; fi\nexit 91\n',
     { mode: 0o700 },
   );
-  const project = path.join(home, "project");
+  const project = path.join(home, projectName);
   fs.mkdirSync(project);
   function git(cwd, ...args) {
     return execFileSync("git", ["-C", cwd, ...args], {
@@ -65,7 +65,7 @@ function fixture(t) {
       env: { HOME: home, PATH: path.join(home, "bin") + ":" + process.env.PATH },
       encoding: "utf8",
     });
-  return { home, old, current, project, git, newTree, command };
+  return { home, old, current, project, git, oldTree, newTree, command };
 }
 
 test("Migration übernimmt Daten, Token, Run-Bezüge und den registrierten Git-Worktree genau einmal", (t) => {
@@ -506,4 +506,59 @@ test("Identische CrewPip-Hooks in getrennten Gruppen desselben Matchers laufen e
     { matcher: "B", hooks: [newHook] },
     { matcher: "A", hooks: [foreignA, foreignB] },
   ]);
+});
+
+for (const form of ["Symlink", "Nicht-BMP"]) {
+  test("Offener Worktree bleibt am Ort bei " + form + " im Sitzungs-CWD", (t) => {
+    const projectName = form === "Nicht-BMP" ? "project-📂" : "project";
+    const { home, old, current, git, oldTree, newTree, command } = fixture(t, projectName);
+    const nested = path.join(oldTree, "nested");
+    fs.mkdirSync(nested);
+    let cwd = nested;
+    if (form === "Symlink") {
+      const alias = path.join(home, "alias");
+      fs.symlinkSync(oldTree, alias, "dir");
+      cwd = path.join(alias, "nested");
+    }
+    const db = new DatabaseSync(path.join(old, legacyName + ".db"));
+    db.exec("ALTER TABLE sessions ADD COLUMN ended_at TEXT");
+    db.prepare("UPDATE sessions SET cwd=? WHERE id='s'").run(cwd);
+    db.close();
+    for (const args of [["migrate", "--check"], ["migrate"]]) {
+      const result = command(...args);
+      assert.notEqual(result.status, 0, "Offener Worktree wurde zum Umzug freigegeben");
+      assert.match(result.stderr, /geöffneter Chat verwendet/);
+      assert.equal(git(cwd, "branch", "--show-current"), legacyName + "/task");
+      assert.equal(fs.existsSync(newTree), false);
+      assert.equal(fs.existsSync(current), false);
+    }
+  });
+}
+
+test("Historische Sitzungs- und Laufpfade unter einem Symlink werden passend zum verschobenen Worktree übernommen", (t) => {
+  const { home, old, current, oldTree, newTree, command } = fixture(t, "project-📂");
+  const alias = path.join(home, "alias");
+  fs.symlinkSync(oldTree, alias, "dir");
+  fs.mkdirSync(path.join(oldTree, "nested"));
+  const oldDb = new DatabaseSync(path.join(old, legacyName + ".db"));
+  oldDb.exec("ALTER TABLE sessions ADD COLUMN ended_at TEXT");
+  oldDb.prepare("UPDATE sessions SET cwd=?,ended_at='2026-01-01' WHERE id='s'").run(path.join(alias, "nested"));
+  oldDb.prepare("UPDATE runs SET cwd=? WHERE id=4").run(path.join(alias, "nested", "removed-dir"));
+  const adjacent = oldTree + "-separate";
+  fs.mkdirSync(adjacent);
+  oldDb.prepare("INSERT INTO sessions(id,cwd) VALUES ('other',?)").run(adjacent);
+  oldDb.close();
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  const db = new DatabaseSync(path.join(current, "crewpip.db"), { readOnly: true });
+  try {
+    assert.equal(db.prepare("SELECT cwd FROM sessions WHERE id='s'").get().cwd, path.join(newTree, "nested"));
+    assert.equal(
+      db.prepare("SELECT cwd FROM runs WHERE id=4").get().cwd,
+      path.join(newTree, "nested", "removed-dir"),
+    );
+    assert.equal(db.prepare("SELECT cwd FROM sessions WHERE id='other'").get().cwd, adjacent);
+  } finally {
+    db.close();
+  }
 });

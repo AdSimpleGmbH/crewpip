@@ -23,8 +23,8 @@ const home = os.homedir();
 const plistPath = path.join(home, "Library/LaunchAgents", `${LABEL}.plist`);
 const dataDir = path.join(home, ".crewpip");
 const logPath = path.join(dataDir, "daemon.log");
-function installedEnvironment() {
-  if (!fs.existsSync(plistPath) || process.argv[2] === "migrate") return process.env;
+function installedConfiguration() {
+  if (!fs.existsSync(plistPath) || process.argv[2] === "migrate") return null;
   const configuration = JSON.parse(
     execFileSync("plutil", ["-convert", "json", "-o", "-", plistPath], {
       encoding: "utf8",
@@ -32,9 +32,10 @@ function installedEnvironment() {
     }),
   );
   if (configuration.Label !== LABEL) throw new Error("Fremde LaunchAgent-Konfiguration");
-  return configuration.EnvironmentVariables ?? {};
+  return configuration;
 }
-const serviceEnv = installedEnvironment();
+const installed = installedConfiguration();
+const serviceEnv = installed ? (installed.EnvironmentVariables ?? {}) : process.env;
 const port = serviceEnv.CREWPIP_PORT ?? "7357";
 const domain = `gui/${process.getuid()}`;
 
@@ -168,8 +169,25 @@ async function main() {
       }
       fs.mkdirSync(path.dirname(plistPath), { recursive: true });
       fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+      if (!installed) {
+        fs.writeFileSync(plistPath, plist(), { flag: "wx", mode: 0o600 });
+      } else if (installed.ProgramArguments?.[0] !== process.execPath) {
+        // Ein Node-Upgrade kann den bisherigen versionsgebundenen Pfad entfernen.
+        // Nur den Interpreter austauschen, bevor der laufende Dienst gestoppt wird.
+        const args = installed.ProgramArguments;
+        if (!Array.isArray(args) || !args.length) throw new Error("ProgramArguments fehlen in der Dienst-Plist");
+        const argumentsJson = JSON.stringify([process.execPath, ...args.slice(1)]);
+        // plutil fügt bei einem numerischen letzten Schlüsselpfad ein Arrayelement ein.
+        const update = spawnSync(
+          "plutil",
+          ["-replace", "ProgramArguments", "-json", argumentsJson, "--", plistPath],
+          {
+            stdio: "ignore",
+          },
+        );
+        if (update.status !== 0) throw new Error("Node-Pfad in der Dienst-Plist konnte nicht aktualisiert werden");
+      }
       await bootout();
-      if (!fs.existsSync(plistPath)) fs.writeFileSync(plistPath, plist(), { flag: "wx", mode: 0o600 });
       bootstrap();
       const h = await waitHealthy();
       if (!h) {
