@@ -15,10 +15,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import { daemonEntry, serviceRuntime } from "./service-runtime.mjs";
 
 const LABEL = "crewpip";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const entry = path.join(repoRoot, "apps/daemon/dist/index.js");
+const entry = daemonEntry(repoRoot);
 const home = os.homedir();
 const plistPath = path.join(home, "Library/LaunchAgents", `${LABEL}.plist`);
 const dataDir = path.join(home, ".crewpip");
@@ -39,25 +41,8 @@ const serviceEnv = installed ? (installed.EnvironmentVariables ?? {}) : process.
 const port = serviceEnv.CREWPIP_PORT ?? "7357";
 const domain = `gui/${process.getuid()}`;
 
-/**
- * Suchpfad des Dienstes. node liegt bei Homebrew unter .../Cellar/node/<version>/bin, dort
- * stehen aber keine global installierten Programme wie `claude`. Ohne die üblichen
- * bin-Verzeichnisse fände der Runner sie nicht.
- */
-function servicePath() {
-  const dirs = [
-    path.dirname(process.execPath),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-  ];
-  return [...new Set(dirs)].join(":");
-}
-
 function plist() {
+  const runtime = serviceRuntime(repoRoot);
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -66,15 +51,15 @@ function plist() {
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${esc(process.execPath)}</string>
-    <string>${esc(entry)}</string>
+    <string>${esc(runtime.args[0])}</string>
+    <string>${esc(runtime.args[1])}</string>
   </array>
-  <key>WorkingDirectory</key><string>${esc(repoRoot)}</string>
+  <key>WorkingDirectory</key><string>${esc(runtime.workingDirectory)}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>CREWPIP_PORT</key><string>${esc(port)}</string>
     <key>CREWPIP_DB</key><string>${esc(path.join(dataDir, "crewpip.db"))}</string>
-    <key>PATH</key><string>${esc(servicePath())}</string>
+    <key>PATH</key><string>${esc(runtime.searchPath)}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -139,28 +124,28 @@ async function waitHealthy(tries = 20) {
   return null;
 }
 
-function refreshNode(configuration) {
-  const args = configuration.ProgramArguments;
-  if (!Array.isArray(args) || typeof args[0] !== "string")
-    throw new Error("ProgramArguments fehlen in der Dienst-Plist");
-  const previousBin = path.dirname(args[0]);
-  const nextBin = path.dirname(process.execPath);
-  const directories = configuration.EnvironmentVariables?.PATH?.split(path.delimiter);
+function refreshRuntime(configuration) {
+  const runtime = serviceRuntime(repoRoot, configuration);
+  const changes = [
+    ["ProgramArguments", configuration.ProgramArguments, runtime.args],
+    ["WorkingDirectory", configuration.WorkingDirectory, runtime.workingDirectory],
+    ["EnvironmentVariables.PATH", configuration.EnvironmentVariables?.PATH, runtime.searchPath],
+  ].filter(([, previous, next]) => !isDeepStrictEqual(previous, next));
+  if (!changes.length) return;
   const temporary = fs.mkdtempSync(path.join(path.dirname(plistPath), ".crewpip-"));
   const staged = path.join(temporary, "service.plist");
   try {
-    // Erst beide Änderungen mit den vorhandenen Dateirechten vorbereiten. So
-    // kann ein fehlgeschlagener Aufruf den Interpreter und PATH nicht trennen.
+    // Die Startfelder gemeinsam austauschen, damit Interpreter, Build,
+    // Arbeitsverzeichnis und Suchpfad stets zu demselben Start gehören.
     execFileSync("/bin/cp", ["-p", plistPath, staged], { stdio: "ignore" });
-    const change = (key, type, value) => {
-      const result = spawnSync("plutil", ["-replace", key, type, value, "--", staged], { stdio: "ignore" });
+    for (const [key, previous, value] of changes) {
+      const operation = previous === undefined ? "-insert" : "-replace";
+      // ProgramArguments als Array ersetzen. Ein numerischer letzter Schlüssel
+      // würde mit plutil ein Element einfügen.
+      const result = spawnSync("plutil", [operation, key, "-json", JSON.stringify(value), "--", staged], {
+        stdio: "ignore",
+      });
       if (result.status !== 0) throw new Error("Dienst-Plist konnte nicht aktualisiert werden: " + key);
-    };
-    // Ein numerischer letzter Schlüsselpfad würde bei plutil ein Element einfügen.
-    change("ProgramArguments", "-json", JSON.stringify([process.execPath, ...args.slice(1)]));
-    if (previousBin !== nextBin && directories?.[0] === previousBin) {
-      const pathEntries = [nextBin, ...directories.slice(1).filter((dir) => dir !== nextBin)];
-      change("EnvironmentVariables.PATH", "-string", pathEntries.join(path.delimiter));
     }
     fs.renameSync(staged, plistPath);
   } finally {
@@ -200,8 +185,8 @@ async function main() {
       fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
       if (!installed) {
         fs.writeFileSync(plistPath, plist(), { flag: "wx", mode: 0o600 });
-      } else if (installed.ProgramArguments?.[0] !== process.execPath) {
-        refreshNode(installed);
+      } else {
+        refreshRuntime(installed);
       }
       await bootout();
       bootstrap();

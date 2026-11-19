@@ -8,6 +8,7 @@ import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { configChanges, installationToken, restoreConfig } from "./migrate-config.mjs";
+import { daemonEntry, serviceRuntime } from "./service-runtime.mjs";
 
 export const oldLabel = "at.ostheimer." + legacyName;
 const label = "crewpip";
@@ -93,20 +94,15 @@ function getPlist(file) {
 
 function buildPlist(file, repo, old, current) {
   const doc = getPlist(file);
-  if (
-    doc.Label !== oldLabel ||
-    doc.ProgramArguments?.length !== 2 ||
-    !doc.ProgramArguments[1].endsWith("/apps/daemon/dist/index.js") ||
-    doc.Program
-  ) {
-    throw new Error("Dienst verwendet eine angepasste Startkonfiguration; vor dem Umzug prüfen");
-  }
+  if (doc.Label !== oldLabel) throw new Error("Die bisherige Dienst-Plist enthält eine fremde Kennung");
+  const runtime = serviceRuntime(repo, doc);
   doc.Label = label;
-  doc.ProgramArguments = [process.execPath, path.join(repo, "apps/daemon/dist/index.js")];
-  doc.WorkingDirectory = repo;
+  doc.ProgramArguments = runtime.args;
+  doc.WorkingDirectory = runtime.workingDirectory;
   for (const k of ["StandardOutPath", "StandardErrorPath"])
     if (doc[k]?.startsWith(old + "/")) doc[k] = current + doc[k].slice(old.length);
   const env = doc.EnvironmentVariables ?? {};
+  if (runtime.searchPath !== undefined) env.PATH = runtime.searchPath;
   const prefix = legacyName.toUpperCase() + "_";
   if (env[prefix + "DB"] && env[prefix + "DB"] !== path.join(old, oldDb))
     throw new Error("Externen Datenbankpfad vor dem Umzug prüfen");
@@ -553,8 +549,7 @@ export async function migrateInstallation({ repo, check = false, recover = false
     throw new Error("Vorhandener Zieldatenordner ohne passendes lokales Token");
   }
   if (wasLoaded && !plist) throw new Error("Geladener Dienst ohne ursprüngliche Plist");
-  if (plist && !exists(path.join(repo, "apps/daemon/dist/index.js")))
-    throw new Error("Vor dem Umzug pnpm build ausführen");
+  if (plist && !exists(daemonEntry(repo))) throw new Error("Vor dem Umzug pnpm build ausführen");
   if (check) {
     console.log(
       `Umzug möglich: ${changes.length} Konfigurationsdateien, ${before.trees.length} Worktrees, Login-Dienst ${wasLoaded ? "aktiv" : "inaktiv"}.`,
@@ -599,7 +594,7 @@ export async function migrateInstallation({ repo, check = false, recover = false
       old,
       oldPlist,
       newPlist,
-      newEntry: path.join(repo, "apps/daemon/dist/index.js"),
+      newEntry: daemonEntry(repo),
       plist: !!plist,
       wasLoaded,
       trees: before.trees,

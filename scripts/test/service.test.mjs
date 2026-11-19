@@ -142,3 +142,151 @@ exit 1
     },
   );
 }
+
+const runtimeCases = [
+  { action: "migrate", upgrade: true, managed: true },
+  { action: "migrate", upgrade: true, managed: false },
+  { action: "migrate", upgrade: false, managed: true },
+  ...["install", "restart"].flatMap((action) =>
+    [false, true].map((upgrade) => ({ action, upgrade, managed: true })),
+  ),
+];
+
+for (const { action, upgrade, managed } of runtimeCases) {
+  test(`Ersatzcheckout bei ${action}, ${upgrade ? "neuer" : "gleicher"} Node und ${managed ? "verwaltetem" : "individuellem"} PATH`, async (t) => {
+    const { legacyName, oldLabel } = await import("../migration.mjs");
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-checkout-")));
+    const pidFile = path.join(home, "fixture.pid");
+    t.after(() => {
+      try {
+        if (fs.existsSync(pidFile)) process.kill(Number(fs.readFileSync(pidFile, "utf8")), "SIGTERM");
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+    const checkout = path.join(home, "replacement");
+    const priorCheckout = path.join(home, "previous");
+    const daemon = "apps/daemon/dist/index.js";
+    const args = action === "migrate" && upgrade ? [] : ["--example", "extra value"];
+    const newBin = path.join(home, "v2/bin");
+    const oldBin = upgrade ? path.join(home, "v1/bin") : newBin;
+    const custom = path.join(home, "company/bin");
+    for (const bin of [newBin, custom]) {
+      fs.mkdirSync(bin, { recursive: true });
+      fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    }
+    const node = path.join(newBin, "node");
+    fs.copyFileSync(process.execPath, node, fs.constants.COPYFILE_FICLONE);
+    const runner = pathToFileURL(path.join(repo, "apps/daemon/src/runner/apps.ts")).href;
+    for (const root of [priorCheckout, checkout]) {
+      const entry = path.join(root, daemon);
+      fs.mkdirSync(path.dirname(entry), { recursive: true });
+      fs.writeFileSync(
+        entry,
+        `
+const http = require("node:http");
+import(${JSON.stringify(runner)}).then(({ claudeApp }) => {
+  const report = { entry: __filename, cwd: process.cwd(), args: process.argv.slice(2), node: process.execPath, cli: claudeApp.bin(), setting: process.env.APP_SETTING, path: process.env.PATH };
+  http.createServer((req, res) => {
+    res.writeHead(req.headers["x-crewpip-token"] === "fixture-only" ? 200 : 401, { "content-type": "application/json" });
+    res.end(JSON.stringify(report));
+  }).listen(Number(process.env.CREWPIP_PORT), "127.0.0.1");
+});
+`,
+      );
+    }
+    fs.cpSync(path.join(repo, "scripts"), path.join(checkout, "scripts"), { recursive: true });
+    fs.symlinkSync(path.join(repo, "node_modules"), path.join(checkout, "node_modules"));
+    const shimDir = path.join(home, "test-bin");
+    fs.mkdirSync(shimDir);
+    // launchd ist ersetzt. Der übernommene Interpreter startet den ausgewählten
+    // Build tatsächlich im konfigurierten Arbeitsverzeichnis mit der Plist-Umgebung.
+    const launchctl = path.join(shimDir, "launchctl");
+    fs.writeFileSync(
+      launchctl,
+      `#!/usr/bin/python3
+import os, pathlib, plistlib, subprocess, sys
+pid = pathlib.Path.home() / "fixture.pid"
+action = sys.argv[1]
+if action == "print":
+    print("Could not find service", file=sys.stderr)
+    sys.exit(113)
+if action == "getenv":
+    sys.exit(1)
+if action == "bootout":
+    sys.exit(0)
+if action != "bootstrap":
+    sys.exit(2)
+with open(sys.argv[3], "rb") as f:
+    doc = plistlib.load(f)
+with open(os.devnull, "r+b") as devnull:
+    child = subprocess.Popen(doc["ProgramArguments"], cwd=doc["WorkingDirectory"],
+        env={"HOME": str(pathlib.Path.home()), **doc["EnvironmentVariables"]},
+        stdin=devnull, stdout=devnull, stderr=devnull, start_new_session=True)
+pid.write_text(str(child.pid))
+`,
+      { mode: 0o700 },
+    );
+
+    const reservation = http.createServer();
+    reservation.listen(0, "127.0.0.1");
+    await once(reservation, "listening");
+    const port = reservation.address().port;
+    await new Promise((resolve) => reservation.close(resolve));
+    const migration = action === "migrate";
+    const label = migration ? oldLabel : "crewpip";
+    const data = path.join(home, migration ? "." + legacyName : ".crewpip");
+    fs.mkdirSync(data);
+    fs.writeFileSync(path.join(data, "token"), "fixture-only\n");
+    const agents = path.join(home, "Library/LaunchAgents");
+    const env = { HOME: home, PATH: shimDir + ":" + process.env.PATH };
+    const searchPath = managed ? [oldBin, custom, "/usr/bin"] : [custom, oldBin, "/usr/bin"];
+    const expectedPath = managed ? [newBin, custom, "/usr/bin"] : searchPath;
+    fs.mkdirSync(agents, { recursive: true });
+    fs.writeFileSync(
+      path.join(agents, label + ".plist"),
+      execFileSync("plutil", ["-convert", "binary1", "-o", "-", "--", "-"], {
+        input: JSON.stringify({
+          Label: label,
+          ProgramArguments: [path.join(oldBin, "node"), path.join(priorCheckout, daemon), ...args],
+          WorkingDirectory: priorCheckout,
+          EnvironmentVariables: {
+            [(migration ? legacyName.toUpperCase() : "CREWPIP") + "_PORT"]: String(port),
+            APP_SETTING: "retain",
+            PATH: searchPath.join(":"),
+          },
+        }),
+      }),
+    );
+    await run(node, [path.join(checkout, "scripts/service.mjs"), action], { env, timeout: 20000 });
+    if (migration) {
+      // Den übernommenen, zuvor gestoppten Dienst direkt laden. Ein zusätzliches
+      // install oder restart würde einen Migrationsfehler in der Plist verdecken.
+      await run(launchctl, ["bootstrap", "gui/test", path.join(agents, "crewpip.plist")], { env });
+    }
+    const endpoint = "http://127.0.0.1:" + port + "/api/health";
+    let health;
+    for (let attempt = 0; attempt < 30 && !health; attempt++) {
+      health = await fetch(endpoint, { headers: { "x-crewpip-token": "fixture-only" } }).catch(() => null);
+      if (!health) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(health?.status, 200, "Der gestartete Test-Build muss erreichbar sein");
+    const report = await health.json();
+    assert.equal(report.entry, path.join(checkout, daemon), "Health antwortet aus dem falschen Checkout");
+    assert.equal(report.cwd, checkout);
+    assert.equal(
+      report.cli,
+      path.join(managed ? newBin : custom, "claude"),
+      "Der Runner findet die zugesagte CLI nicht",
+    );
+    assert.deepEqual(report, {
+      entry: path.join(checkout, daemon),
+      cwd: checkout,
+      args,
+      node,
+      cli: report.cli,
+      setting: "retain",
+      path: expectedPath.join(":"),
+    });
+  });
+}

@@ -415,7 +415,13 @@ test("Ein fehlgeschlagener neuer Login-Dienst stellt Dateien und echte Worktrees
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
   fs.mkdirSync(path.join(repo, "apps/daemon/dist"), { recursive: true });
   fs.writeFileSync(path.join(repo, "apps/daemon/dist/index.js"), "");
-  for (const name of ["service.mjs", "migration.mjs", "migrate-config.mjs", "swap-config.py"]) {
+  for (const name of [
+    "service.mjs",
+    "service-runtime.mjs",
+    "migration.mjs",
+    "migrate-config.mjs",
+    "swap-config.py",
+  ]) {
     fs.copyFileSync(path.join(path.dirname(service), name), path.join(repo, "scripts", name));
   }
   fs.symlinkSync(path.resolve(path.dirname(service), "../node_modules"), path.join(repo, "node_modules"));
