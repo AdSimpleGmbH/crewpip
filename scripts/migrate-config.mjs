@@ -318,9 +318,9 @@ export function installationToken(home, changes, dir, expected) {
         for (const [name, value] of Object.entries(server?.[field] ?? {})) {
           if (name.toLowerCase() !== tokenHeader) continue;
           checkLocalServer(server);
-          const token = field === "env_http_headers" ? process.env[value] : value;
-          if (typeof token !== "string" || !token.trim() || (field === "headers" && /\$\{[^}]+\}/.test(token)))
-            throw new Error();
+          const configured = field === "env_http_headers" ? process.env[value] : value;
+          const token = typeof configured === "string" && configured.trim();
+          if (!token || (field === "headers" && /\$\{[^}]+\}/.test(token))) throw new Error();
           tokens.add(token);
         }
       }

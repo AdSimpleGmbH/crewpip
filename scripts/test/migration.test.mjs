@@ -323,6 +323,25 @@ test("Ein abweichender Tokenheader im bereits eingerichteten zweiten Client stop
   assert.ok(!fs.existsSync(current));
 });
 
+test("HTTP-Randleerzeichen im bestehenden Claude-Header ergeben dasselbe Token wie Codex und die Tokendatei", (t) => {
+  const { home, current, command } = fixture(t);
+  clientConfigs(home);
+  const file = path.join(home, ".claude.json");
+  const server = {
+    url: "http://localhost:7357/mcp/claude",
+    headers: { "X-CrewPip-Token": " \tlocal-test-secret\t " },
+  };
+  const original = JSON.stringify({ mcpServers: { crewpip: server } });
+  fs.writeFileSync(file, original);
+
+  const check = command("migrate", "--check");
+  assert.equal(check.status, 0, check.stderr);
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "local-test-secret\n");
+});
+
 test("Konfigurierter Tokenheader aus der Umgebung behält den Variablennamen und überprüft seinen Wert", (t) => {
   const { env, home, old, current, command } = fixture(t);
   fs.rmSync(old, { recursive: true });
@@ -334,14 +353,14 @@ test("Konfigurierter Tokenheader aus der Umgebung behält den Variablennamen und
   const missing = command("migrate", "--check");
   assert.notEqual(missing.status, 0);
   assert.equal(fs.readFileSync(file, "utf8"), text);
-  env.CREWPIP_TEST_TOKEN = "fixture-from-env";
+  env.CREWPIP_TEST_TOKEN = " \tfixture-from-env\t ";
   const result = command();
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     parseToml(fs.readFileSync(file, "utf8")).mcp_servers.crewpip.env_http_headers["x-crewpip-token"],
     "CREWPIP_TEST_TOKEN",
   );
-  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8").trim(), env.CREWPIP_TEST_TOKEN);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "fixture-from-env\n");
 });
 
 test("Übernimmt bestätigte Transaktionen aus offenem WAL und prüft die unabhängige Sicherung", (t) => {
