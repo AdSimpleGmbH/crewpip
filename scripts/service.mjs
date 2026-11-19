@@ -1,29 +1,41 @@
 #!/usr/bin/env node
 /**
- * launchd-Dienst für den mngboard-Daemon (macOS, pro Benutzer).
+ * launchd-Dienst für den CrewPip-Daemon (macOS, pro Benutzer).
  *
- *   node scripts/service.mjs install    schreibt ~/Library/LaunchAgents/at.ostheimer.mngboard.plist und startet
+ *   node scripts/service.mjs install    schreibt ~/Library/LaunchAgents/crewpip.plist und startet
  *   node scripts/service.mjs uninstall  stoppt und entfernt den Dienst
  *   node scripts/service.mjs restart    startet neu (z. B. nach pnpm build)
  *   node scripts/service.mjs status     zeigt launchd-Zustand und Health-Endpunkt
  *
  * KeepAlive sorgt dafür, dass launchd den Daemon nach einem Absturz neu startet; RunAtLoad
- * startet ihn nach dem Login. Logs liegen unter ~/.mngboard/daemon.log.
+ * startet ihn nach dem Login. Logs liegen unter ~/.crewpip/daemon.log.
  */
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const LABEL = "at.ostheimer.mngboard";
+const LABEL = "crewpip";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entry = path.join(repoRoot, "apps/daemon/dist/index.js");
 const home = os.homedir();
 const plistPath = path.join(home, "Library/LaunchAgents", `${LABEL}.plist`);
-const dataDir = path.join(home, ".mngboard");
+const dataDir = path.join(home, ".crewpip");
 const logPath = path.join(dataDir, "daemon.log");
-const port = process.env.MNGBOARD_PORT ?? "7357";
+function installedEnvironment() {
+  if (!fs.existsSync(plistPath) || process.argv[2] === "migrate") return process.env;
+  const configuration = JSON.parse(
+    execFileSync("plutil", ["-convert", "json", "-o", "-", plistPath], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
+  if (configuration.Label !== LABEL) throw new Error("Fremde LaunchAgent-Konfiguration");
+  return configuration.EnvironmentVariables ?? {};
+}
+const serviceEnv = installedEnvironment();
+const port = serviceEnv.CREWPIP_PORT ?? "7357";
 const domain = `gui/${process.getuid()}`;
 
 /**
@@ -32,7 +44,15 @@ const domain = `gui/${process.getuid()}`;
  * bin-Verzeichnisse fände der Runner sie nicht.
  */
 function servicePath() {
-  const dirs = [path.dirname(process.execPath), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  const dirs = [
+    path.dirname(process.execPath),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
   return [...new Set(dirs)].join(":");
 }
 
@@ -51,8 +71,8 @@ function plist() {
   <key>WorkingDirectory</key><string>${esc(repoRoot)}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>MNGBOARD_PORT</key><string>${esc(port)}</string>
-    <key>MNGBOARD_DB</key><string>${esc(path.join(dataDir, "mngboard.db"))}</string>
+    <key>CREWPIP_PORT</key><string>${esc(port)}</string>
+    <key>CREWPIP_DB</key><string>${esc(path.join(dataDir, "crewpip.db"))}</string>
     <key>PATH</key><string>${esc(servicePath())}</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -88,9 +108,9 @@ function bootstrap() {
 }
 
 function token() {
-  if (process.env.MNGBOARD_TOKEN) return process.env.MNGBOARD_TOKEN.trim();
+  if (serviceEnv.CREWPIP_TOKEN) return serviceEnv.CREWPIP_TOKEN.trim();
   try {
-    return fs.readFileSync(process.env.MNGBOARD_TOKEN_FILE ?? path.join(dataDir, "token"), "utf8").trim();
+    return fs.readFileSync(serviceEnv.CREWPIP_TOKEN_FILE ?? path.join(dataDir, "token"), "utf8").trim();
   } catch {
     return "";
   }
@@ -100,7 +120,7 @@ async function health() {
   try {
     const t = token();
     const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
-      headers: t ? { "x-mngboard-token": t } : {},
+      headers: t ? { "x-crewpip-token": t } : {},
       signal: AbortSignal.timeout(2000),
     });
     return res.ok ? await res.json() : null;
@@ -121,23 +141,44 @@ async function waitHealthy(tries = 20) {
 async function main() {
   const cmd = process.argv[2];
   switch (cmd) {
+    case "check-install": {
+      const { requireMigratedInstallation } = await import("./migration.mjs");
+      requireMigratedInstallation(repoRoot);
+      break;
+    }
+    case "migrate": {
+      const options = process.argv.slice(3).filter((arg) => arg !== "--");
+      if (options.length > 1 || options.some((arg) => !["--check", "--recover"].includes(arg)))
+        throw new Error("Erlaubt sind --check oder --recover");
+      const { migrateInstallation } = await import("./migration.mjs");
+      await migrateInstallation({
+        repo: repoRoot,
+        check: options.includes("--check"),
+        recover: options.includes("--recover"),
+      });
+      break;
+    }
     case "install":
     case "restart": {
+      const { requireMigratedInstallation } = await import("./migration.mjs");
+      requireMigratedInstallation(repoRoot);
       if (!fs.existsSync(entry)) {
         console.error(`Fehlt: ${entry}. Zuerst \`pnpm build\` ausführen.`);
         process.exit(1);
       }
       fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-      fs.mkdirSync(dataDir, { recursive: true });
+      fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
       await bootout();
-      fs.writeFileSync(plistPath, plist());
+      if (!fs.existsSync(plistPath)) fs.writeFileSync(plistPath, plist(), { flag: "wx", mode: 0o600 });
       bootstrap();
       const h = await waitHealthy();
       if (!h) {
         console.error(`Dienst geladen, aber http://127.0.0.1:${port}/api/health antwortet nicht. Log: ${logPath}`);
         process.exit(1);
       }
-      console.log(`${cmd === "install" ? "Installiert" : "Neu gestartet"}: ${LABEL} auf http://127.0.0.1:${port} (Log: ${logPath})`);
+      console.log(
+        `${cmd === "install" ? "Installiert" : "Neu gestartet"}: ${LABEL} auf http://127.0.0.1:${port} (Log: ${logPath})`,
+      );
       break;
     }
     case "uninstall": {
@@ -152,12 +193,14 @@ async function main() {
       const state = loaded ? (r.stdout.match(/state = (\w+)/)?.[1] ?? "unbekannt") : "nicht geladen";
       const pid = loaded ? (r.stdout.match(/pid = (\d+)/)?.[1] ?? "-") : "-";
       const h = await health();
-      console.log(`launchd: ${state}${pid !== "-" ? ` (pid ${pid})` : ""}  plist: ${fs.existsSync(plistPath) ? plistPath : "fehlt"}`);
+      console.log(
+        `launchd: ${state}${pid !== "-" ? ` (pid ${pid})` : ""}  plist: ${fs.existsSync(plistPath) ? plistPath : "fehlt"}`,
+      );
       console.log(`health:  ${h ? `ok, Version ${h.version}` : "keine Antwort"} auf http://127.0.0.1:${port}`);
       process.exit(loaded && h ? 0 : 1);
     }
     default:
-      console.log("Verwendung: node scripts/service.mjs install|uninstall|restart|status");
+      console.log("Verwendung: node scripts/service.mjs install|uninstall|restart|status|migrate");
       process.exit(cmd ? 1 : 0);
   }
 }

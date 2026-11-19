@@ -1,0 +1,467 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync, execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
+import { legacyName, oldLabel } from "../migration.mjs";
+
+const service = fileURLToPath(new URL("../service.mjs", import.meta.url));
+
+function fixture(t) {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-upgrade-")));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const old = path.join(home, "." + legacyName);
+  const current = path.join(home, ".crewpip");
+  fs.mkdirSync(path.join(old, "runs"), { recursive: true });
+  fs.mkdirSync(path.join(old, "backups"));
+  fs.writeFileSync(path.join(old, "runs/4.jsonl"), "example run\n");
+  fs.writeFileSync(path.join(old, "token"), "local-test-secret\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(old, "backups", legacyName + "-2026.db"), "archived data");
+  fs.mkdirSync(path.join(home, "bin"));
+  fs.writeFileSync(
+    path.join(home, "bin", "launchctl"),
+    '#!/bin/sh\nif [ "$1" = print ]; then echo "Could not find service" >&2; exit 113; fi\nexit 91\n',
+    { mode: 0o700 },
+  );
+  const project = path.join(home, "project");
+  fs.mkdirSync(project);
+  function git(cwd, ...args) {
+    return execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  }
+  git(project, "init", "-b", "main");
+  git(
+    project,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.org",
+    "commit",
+    "--allow-empty",
+    "-m",
+    "fixture",
+  );
+  const oldTree = path.join(project, "." + legacyName, "worktrees/task");
+  const newTree = path.join(project, ".crewpip/worktrees/task");
+  git(project, "worktree", "add", "-b", legacyName + "/task", oldTree);
+  fs.writeFileSync(path.join(oldTree, "untracked"), "keep");
+  const db = new DatabaseSync(path.join(old, legacyName + ".db"));
+  db.exec(
+    "CREATE TABLE runs (id INTEGER PRIMARY KEY,status TEXT,cwd TEXT,log_path TEXT); CREATE TABLE projects (id TEXT PRIMARY KEY,root TEXT); CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id TEXT,worktree_path TEXT,worktree_branch TEXT); CREATE TABLE sessions (id TEXT PRIMARY KEY,cwd TEXT); CREATE TABLE messages (id INTEGER PRIMARY KEY,text TEXT); CREATE TABLE deliveries (message_id INTEGER,session_id TEXT)",
+  );
+  db.prepare("INSERT INTO projects VALUES (?,?)").run("p", project);
+  db.prepare("INSERT INTO tasks VALUES (1,'p',?,?)").run(oldTree, legacyName + "/task");
+  db.prepare("INSERT INTO runs VALUES (4,'done',?,?)").run(oldTree, path.join(old, "runs/4.jsonl"));
+  db.prepare("INSERT INTO sessions VALUES ('s',?)").run(oldTree);
+  db.exec("INSERT INTO messages VALUES (8,'saved message'); INSERT INTO deliveries VALUES (8,'s')");
+  db.close();
+  const command = (action = "migrate", ...args) =>
+    spawnSync(process.execPath, [service, action, ...args], {
+      env: { HOME: home, PATH: path.join(home, "bin") + ":" + process.env.PATH },
+      encoding: "utf8",
+    });
+  return { home, old, current, project, git, newTree, command };
+}
+
+test("Migration übernimmt Daten, Token, Run-Bezüge und den registrierten Git-Worktree genau einmal", (t) => {
+  const { old, current, git, newTree, command } = fixture(t);
+  const result = command();
+  assert.ok(
+    fs.existsSync(path.join(current, "crewpip.db")),
+    "Die vorhandene Datenbank muss im neuen Datenordner erscheinen: " + result.stderr,
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(old), false);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "local-test-secret\n");
+  assert.equal(fs.readFileSync(path.join(current, "backups/crewpip-2026.db"), "utf8"), "archived data");
+  const db = new DatabaseSync(path.join(current, "crewpip.db"), { readOnly: true });
+  assert.equal(db.prepare("SELECT text FROM messages WHERE id=8").get().text, "saved message");
+  assert.equal(db.prepare("SELECT session_id FROM deliveries WHERE message_id=8").get().session_id, "s");
+  const run = db.prepare("SELECT cwd,log_path FROM runs WHERE id=4").get();
+  assert.equal(run.cwd, newTree);
+  assert.equal(fs.readFileSync(run.log_path, "utf8"), "example run\n");
+  assert.equal(db.prepare("SELECT worktree_path FROM tasks").get().worktree_path, newTree);
+  assert.equal(db.prepare("SELECT cwd FROM sessions").get().cwd, newTree);
+  assert.equal(git(newTree, "branch", "--show-current"), "crewpip/task");
+  assert.equal(fs.readFileSync(path.join(newTree, "untracked"), "utf8"), "keep");
+  db.close();
+  assert.equal(command().status, 0);
+});
+
+test("Aktive Läufe und widersprüchliche Zielbestände verhindern Änderungen", (t) => {
+  const { old, current, command } = fixture(t);
+  const db = new DatabaseSync(path.join(old, legacyName + ".db"));
+  db.exec("UPDATE runs SET status='running'");
+  assert.notEqual(command().status, 0);
+  assert.equal(fs.existsSync(current), false);
+  db.exec("UPDATE runs SET status='done'");
+  db.close();
+  fs.mkdirSync(current);
+  fs.writeFileSync(path.join(current, "token"), "other installation");
+  assert.notEqual(command().status, 0);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "other installation");
+  assert.ok(fs.existsSync(path.join(old, legacyName + ".db")));
+});
+
+function clientConfigs(home) {
+  const server = {
+    type: "http",
+    url: "http://127.0.0.1:7357/mcp/claude?app=claude",
+    headers: { ["x-" + legacyName + "-token"]: "local-test-secret" },
+  };
+  const prefix = '{\n  "unrelated"   :  { "counter": 9 },\n  "mcpServers": {\n    ';
+  fs.writeFileSync(
+    path.join(home, ".claude.json"),
+    prefix + JSON.stringify(legacyName) + ": " + JSON.stringify(server) + "\n  }\n}\n",
+    { mode: 0o600 },
+  );
+  const target = "/previous/checkout/apps/hook/" + legacyName + "-hook.mjs";
+  for (const [app, file] of [
+    ["claude", ".claude/settings.json"],
+    ["codex", ".codex/hooks.json"],
+  ]) {
+    fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+    const command = "/path/to/node " + target + " " + app + " prompt";
+    fs.writeFileSync(
+      path.join(home, file),
+      JSON.stringify(
+        {
+          retain: " x ",
+          hooks: {
+            UserPromptSubmit: [
+              { hooks: [{ type: "command", command, timeout: 5 }] },
+              { hooks: [{ type: "command", command: "true" }] },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+  }
+  const unrelated = "# Keep this unrelated table (including whitespace).\n[feature]\nflag   = true # preferred\n";
+  fs.writeFileSync(
+    path.join(home, ".codex/config.toml"),
+    unrelated +
+      '\n[ mcp_servers."' +
+      legacyName +
+      '" ] # keep this comment\nurl = "http://127.0.0.1:7357/mcp/codex?app=codex"\n[ mcp_servers."' +
+      legacyName +
+      '".http_headers ]\n"x-' +
+      legacyName +
+      '-token" = "local-test-secret"  # private\n',
+  );
+  fs.writeFileSync(
+    path.join(home, ".claude/settings.local.json"),
+    '{"mcpServers":{' + JSON.stringify(legacyName) + ":{}}}",
+  );
+  return { prefix, unrelated };
+}
+
+test("Vier globale Dateien werden punktgenau gesichert und umgestellt, fremde Bereiche bleiben bytegleich", (t) => {
+  const { home, project, old, current, command } = fixture(t);
+  const { prefix, unrelated } = clientConfigs(home);
+  const foreign = fs.readFileSync(path.join(home, ".claude/settings.local.json"), "utf8");
+  fs.writeFileSync(path.join(project, ".mcp.json"), foreign);
+  const files = [".claude.json", ".codex/config.toml", ".claude/settings.json", ".codex/hooks.json"];
+  const originals = files.map((f) => fs.readFileSync(path.join(home, f), "utf8"));
+  const check = command("migrate", "--check");
+  assert.equal(check.status, 0, check.stderr);
+  assert.ok(check.stdout.includes("4 Konfigurationsdateien"));
+  assert.ok(fs.existsSync(old));
+  assert.ok(!fs.existsSync(current));
+  assert.deepEqual(
+    files.map((f) => fs.readFileSync(path.join(home, f), "utf8")),
+    originals,
+  );
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(!result.stdout.includes("local-test-secret"));
+  const mcp = fs.readFileSync(path.join(home, files[0]), "utf8");
+  assert.ok(mcp.startsWith(prefix));
+  assert.ok(JSON.parse(mcp).mcpServers.crewpip.headers["x-crewpip-token"]);
+  const toml = fs.readFileSync(path.join(home, files[1]), "utf8");
+  assert.ok(toml.startsWith(unrelated));
+  assert.ok(toml.includes("# keep this comment"));
+  assert.ok(toml.includes("  # private"));
+  for (const file of files.slice(2)) {
+    const hooks = JSON.parse(fs.readFileSync(path.join(home, file))).hooks.UserPromptSubmit;
+    assert.equal(hooks.length, 2);
+    assert.equal(hooks[1].hooks[0].command, "true");
+    assert.ok(hooks[0].hooks[0].command.startsWith("/path/to/node "));
+    assert.ok(hooks[0].hooks[0].command.includes("/apps/hook/crewpip-hook.mjs"));
+  }
+  assert.equal(fs.readFileSync(path.join(home, ".claude/settings.local.json"), "utf8"), foreign);
+  assert.equal(fs.readFileSync(path.join(project, ".mcp.json"), "utf8"), foreign);
+  const backupRoot = path.join(home, ".crewpip-migration-backups");
+  const backup = path.join(backupRoot, fs.readdirSync(backupRoot)[0]);
+  const journal = JSON.parse(fs.readFileSync(path.join(backup, "migration.json")));
+  for (const change of journal.changes)
+    assert.equal(
+      fs.readFileSync(change.saved, "utf8"),
+      originals[files.indexOf(path.relative(home, change.file))],
+    );
+});
+
+test("Konfigurationsbestand ohne Datenordner behält das vereinbarte lokale Token", (t) => {
+  const { home, old, current, command } = fixture(t);
+  fs.rmSync(old, { recursive: true });
+  clientConfigs(home);
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "local-test-secret\n");
+  assert.equal(command().status, 0);
+});
+
+test("Übernimmt bestätigte Transaktionen aus offenem WAL und prüft die unabhängige Sicherung", (t) => {
+  const { home, old, current, command } = fixture(t);
+  const file = path.join(old, legacyName + ".db");
+  const interrupted = spawnSync(process.execPath, [
+    "--input-type=module",
+    "-e",
+    `
+    import {DatabaseSync} from 'node:sqlite';
+    const db=new DatabaseSync(process.argv[1]); db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO messages VALUES(19,'wal-only')");
+    process.kill(process.pid,'SIGKILL');
+  `,
+    file,
+  ]);
+  assert.equal(interrupted.signal, "SIGKILL");
+  assert.ok(fs.statSync(file + "-wal").size > 0);
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  const backupRoot = path.join(home, ".crewpip-migration-backups");
+  const backup = path.join(backupRoot, fs.readdirSync(backupRoot)[0], "data", legacyName + ".db");
+  for (const f of [path.join(current, "crewpip.db"), backup]) {
+    const db = new DatabaseSync(f, { readOnly: true });
+    assert.equal(db.prepare("SELECT text FROM messages WHERE id=19").get().text, "wal-only");
+    db.close();
+  }
+});
+
+test("Ein Konflikt zwischen MCP-Einträgen verändert weder Konfiguration noch Datenbank", (t) => {
+  const { home, old, current, command } = fixture(t);
+  clientConfigs(home);
+  const p = path.join(home, ".claude.json");
+  const doc = JSON.parse(fs.readFileSync(p));
+  doc.mcpServers.crewpip = { url: "http://127.0.0.1:9000/mcp/claude" };
+  const text = JSON.stringify(doc);
+  fs.writeFileSync(p, text);
+  const result = command();
+  assert.notEqual(result.status, 0);
+  assert.ok(!result.stderr.includes("local-test-secret"));
+  assert.ok(fs.existsSync(old));
+  assert.ok(!fs.existsSync(current));
+  assert.equal(fs.readFileSync(p, "utf8"), text);
+});
+
+test("Ein fehlgeschlagener neuer Login-Dienst stellt Dateien und echte Worktrees ohne Start des falschen Builds wieder her", (t) => {
+  const { home, git, project, old, current } = fixture(t);
+  clientConfigs(home);
+  const agents = path.join(home, "Library/LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const previous = oldLabel;
+  const repo = path.join(home, "service-fixture");
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "apps/daemon/dist"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "apps/daemon/dist/index.js"), "");
+  for (const name of ["service.mjs", "migration.mjs", "migrate-config.mjs", "swap-config.py"]) {
+    fs.copyFileSync(path.join(path.dirname(service), name), path.join(repo, "scripts", name));
+  }
+  fs.symlinkSync(path.resolve(path.dirname(service), "../node_modules"), path.join(repo, "node_modules"));
+  const plist = path.join(agents, previous + ".plist");
+  const xml = execFileSync("plutil", ["-convert", "xml1", "-o", "-", "--", "-"], {
+    input: JSON.stringify({
+      Label: previous,
+      ProgramArguments: [process.execPath, path.join(repo, "apps/daemon/dist/index.js")],
+      WorkingDirectory: repo,
+      RunAtLoad: true,
+      KeepAlive: true,
+      EnvironmentVariables: { [legacyName.toUpperCase() + "_DB"]: path.join(old, legacyName + ".db") },
+    }),
+  });
+  fs.writeFileSync(plist, xml);
+  fs.writeFileSync(path.join(home, "bin/ps"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(home, "loaded"), "1");
+  fs.writeFileSync(
+    path.join(home, "bin/launchctl"),
+    `#!/bin/sh
+case "$1" in
+  print) if [ "$2" = "gui/$(id -u)/${previous}" ] && [ -f "$HOME/loaded" ]; then echo "pid = 2012345678"; exit 0; fi; echo 'Could not find service' >&2; exit 113;;
+  getenv) exit 1;;
+  bootout) rm "$HOME/loaded"; exit 0;;
+  bootstrap) echo "$3" >> "$HOME/starts"; exit 1;;
+esac
+exit 92
+`,
+    { mode: 0o700 },
+  );
+  const config = fs.readFileSync(path.join(home, ".claude.json"));
+  const result = spawnSync(process.execPath, [path.join(repo, "scripts/service.mjs"), "migrate"], {
+    env: { HOME: home, PATH: path.join(home, "bin") + ":" + process.env.PATH },
+    encoding: "utf8",
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Altdienst kontrolliert gestoppt/);
+  assert.deepEqual(fs.readFileSync(plist), xml);
+  assert.deepEqual(fs.readFileSync(path.join(home, ".claude.json")), config);
+  assert.ok(fs.existsSync(old));
+  assert.ok(!fs.existsSync(current));
+  assert.equal(
+    git(path.join(project, "." + legacyName, "worktrees/task"), "branch", "--show-current"),
+    legacyName + "/task",
+  );
+  assert.equal(fs.readFileSync(path.join(home, "starts"), "utf8").trim(), path.join(agents, "crewpip.plist"));
+});
+
+test("Blockiert offene SQLite-Besitzer und jede vorbestehende Ziel-Sidecardatei beim Vorabcheck", (t) => {
+  const { old, current, command } = fixture(t);
+  const db = new DatabaseSync(path.join(old, legacyName + ".db"));
+  try {
+    const held = command("migrate", "--check");
+    assert.notEqual(held.status, 0);
+    assert.match(held.stderr, /anderer Prozess/);
+  } finally {
+    db.close();
+  }
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    const target = path.join(old, "crewpip.db" + suffix);
+    fs.writeFileSync(target, "pre-existing");
+    const preflight = command("migrate", "--check");
+    assert.notEqual(preflight.status, 0);
+    assert.match(preflight.stderr, /Sidecardatei/);
+    assert.equal(fs.readFileSync(target, "utf8"), "pre-existing");
+    fs.unlinkSync(target);
+  }
+  assert.ok(!fs.existsSync(current));
+});
+
+test("Erhält ACL-Regelwirkung, Moderator-Matcher und Inline-TOML mitsamt Codex-Tool-Overrides", (t) => {
+  const { home, command } = fixture(t);
+  clientConfigs(home);
+  const file = path.join(home, ".claude/settings.json");
+  const doc = JSON.parse(fs.readFileSync(file));
+  const original = doc.hooks.UserPromptSubmit[0].hooks[0];
+  const target = path.resolve(path.dirname(service), "../apps/hook/crewpip-hook.mjs");
+  doc.hooks.UserPromptSubmit[0] = {
+    matcher: "only-this-matcher",
+    hooks: [
+      original,
+      { ...original, command: "/path/to/node " + target + " claude prompt" },
+      { command: "unrelated" },
+    ],
+  };
+  const old = "mcp__" + legacyName;
+  doc.permissions = {
+    allow: [old + "__list_sessions", "Read"],
+    deny: [old + "__post_message"],
+    ask: [old + "__read_inbox"],
+  };
+  fs.writeFileSync(file, JSON.stringify(doc));
+  const tomlFile = path.join(home, ".codex/config.toml");
+  fs.writeFileSync(
+    tomlFile,
+    "[mcp_servers." +
+      legacyName +
+      ']\nurl="http://localhost:7357/mcp/codex"\nhttp_headers = { "x-' +
+      legacyName +
+      '-token" = "local-test-secret" } # inline\n[mcp_servers.' +
+      legacyName +
+      '.tools.post_message]\napproval_mode = "prompt"\n',
+  );
+  const result = command();
+  assert.equal(result.status, 0, result.stderr);
+  const after = JSON.parse(fs.readFileSync(file));
+  assert.deepEqual(after.permissions, {
+    allow: ["mcp__crewpip__list_sessions", "Read"],
+    deny: ["mcp__crewpip__post_message"],
+    ask: ["mcp__crewpip__read_inbox"],
+  });
+  assert.equal(after.hooks.UserPromptSubmit[0].matcher, "only-this-matcher");
+  assert.deepEqual(
+    after.hooks.UserPromptSubmit[0].hooks.map((h) => h.command),
+    ["/path/to/node " + target + " claude prompt", "unrelated"],
+  );
+  const text = fs.readFileSync(tomlFile, "utf8");
+  assert.ok(text.includes('http_headers = { "x-crewpip-token"'));
+  assert.ok(text.includes("} # inline"));
+  assert.ok(text.includes('[mcp_servers.crewpip.tools.post_message]\napproval_mode = "prompt"'));
+});
+
+test("Bei konkurrierenden alten und neuen Freigaberegeln wird vor jeder Änderung abgebrochen", (t) => {
+  const { home, old, command } = fixture(t);
+  clientConfigs(home);
+  const file = path.join(home, ".claude/settings.json");
+  const doc = JSON.parse(fs.readFileSync(file));
+  doc.permissions = { allow: ["mcp__" + legacyName + "__post_message"], deny: ["mcp__crewpip__post_message"] };
+  fs.writeFileSync(file, JSON.stringify(doc));
+  const result = command("migrate", "--check");
+  assert.notEqual(result.status, 0);
+  assert.ok(fs.existsSync(old));
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)), doc);
+});
+
+test("Ungeeignete effektive Dienstvariablen werden vor dem Start abgewiesen", (t) => {
+  const { home, old, command } = fixture(t);
+  const agents = path.join(home, "Library/LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const name = oldLabel;
+  const plist = path.join(agents, name + ".plist");
+  fs.writeFileSync(
+    path.join(home, "bin/launchctl"),
+    '#!/bin/sh\nif [ "$1" = getenv ]; then exit 1; fi\necho "Could not find service" >&2; exit 113\n',
+    { mode: 0o700 },
+  );
+  for (const env of [
+    { CREWPIP_AUTH: "off" },
+    { CREWPIP_HOST: "0.0.0.0" },
+    { CREWPIP_DB: "/foreign/board.db" },
+    { CREWPIP_PORT: "no-port" },
+  ]) {
+    fs.writeFileSync(
+      plist,
+      JSON.stringify({
+        Label: name,
+        ProgramArguments: [process.execPath, path.join(home, "apps/daemon/dist/index.js")],
+        EnvironmentVariables: env,
+      }),
+    );
+    const c = command("migrate", "--check");
+    assert.notEqual(c.status, 0);
+    assert.match(c.stderr, /Effektive Dienstkonfiguration/);
+    assert.ok(fs.existsSync(old));
+  }
+});
+
+test("Das globale lokale Token darf bei fehlender Datei keinem neuen zufälligen Token weichen", (t) => {
+  const { home, old, current, command } = fixture(t);
+  clientConfigs(home);
+  fs.unlinkSync(path.join(old, "token"));
+  const c = command();
+  assert.equal(c.status, 0, c.stderr);
+  assert.equal(fs.readFileSync(path.join(current, "token"), "utf8"), "local-test-secret\n");
+});
+
+test("Die persönliche Browser-Absenderwahl übernimmt nur der erste Besuch", async () => {
+  const vm = await import("node:vm");
+  const source = fs.readFileSync(
+    path.resolve(path.dirname(service), "../apps/web/public/migrate-storage.js"),
+    "utf8",
+  );
+  const values = new Map([[legacyName + ".humanName", "local name"]]);
+  const localStorage = {
+    getItem: (k) => values.get(k) ?? null,
+    setItem: (k, v) => values.set(k, v),
+    removeItem: (k) => values.delete(k),
+  };
+  vm.runInNewContext(source, { localStorage });
+  assert.equal(values.get("crewpip.humanName"), "local name");
+  values.set("crewpip.humanName", "new choice");
+  vm.runInNewContext(source, { localStorage });
+  assert.equal(values.get("crewpip.humanName"), "new choice");
+});
