@@ -35,45 +35,52 @@ function migrateServer(server, old) {
   return next;
 }
 
-function hookCommand(command, old, repo) {
+// Die App-Snippets verwenden einen Node-Befehl, einen Skriptpfad und zwei
+// Argumente. Ein absoluter Interpreter und quotierte Pfade bleiben gültig.
+const hookPattern =
+  /^(\s*(?:'[^']+'|"[^"]+"|\S+)\s+)(?:'([^']+)'|"([^"]+)"|(\S+))(\s+(?:claude|codex|cursor)\s+(?:session-start|prompt|stop|session-end)\s*)$/;
+
+function parseHook(command) {
+  const match = hookPattern.exec(command);
+  return match && { prefix: match[1], script: match[2] ?? match[3] ?? match[4], args: match[5] };
+}
+
+function hookCommand(command, old, target) {
   const previous = old + "-hook.mjs";
   if (!command.includes(previous)) return command;
-  // Nur die von den Snippets erzeugte Befehlsform zulassen, auch bei einem
-  // absolut angegebenen Node-Interpreter oder in Anführungszeichen gesetzten Pfaden.
-  const match =
-    /^(\s*(?:'[^']+'|"[^"]+"|\S+)\s+)(?:'([^']+)'|"([^"]+)"|(\S+))(\s+(?:claude|codex|cursor)\s+(?:session-start|prompt|stop|session-end)\s*)$/.exec(
-      command,
-    );
-  const file = match && (match[2] ?? match[3] ?? match[4]);
-  if (!file || !file.endsWith("/apps/hook/" + previous))
+  const parsed = parseHook(command);
+  if (!parsed?.script.endsWith("/apps/hook/" + previous))
     throw new Error("Angepassten Hook vor dem Umzug einzeln prüfen");
-  const target = path.join(repo, "apps/hook/crewpip-hook.mjs");
   const quoted = /^[/\w.-]+$/.test(target) ? target : "'" + target.replaceAll("'", "'\\''") + "'";
-  return match[1] + quoted + match[5];
+  return parsed.prefix + quoted + parsed.args;
 }
 
 function migrateHooks(hooks, old, repo) {
+  const target = path.join(repo, "apps/hook/crewpip-hook.mjs");
   for (const [event, groups] of Object.entries(hooks)) {
     if (!Array.isArray(groups)) continue;
+    // Jede Gruppe behält ihren Ort. Nur bereits vertretene Board-Hooks mit
+    // gleichem Gruppen-Kontext und vollständig gleicher Hook-Konfiguration entfallen.
+    const seen = [];
     const result = [];
     for (const group of groups) {
-      const updated = structuredClone(group);
-      for (const hook of updated.hooks ?? [updated]) {
-        if (typeof hook.command === "string") hook.command = hookCommand(hook.command, old, repo);
+      const { hooks: entries, ...context } = group;
+      const updated = [];
+      for (const hook of entries ?? [group]) {
+        if (typeof hook.command !== "string") {
+          updated.push(hook);
+          continue;
+        }
+        const next = { ...hook, command: hookCommand(hook.command, old, target) };
+        if (parseHook(next.command)?.script === target) {
+          const configured = { context: entries ? context : null, hook: next };
+          if (seen.some((existing) => equal(existing, configured))) continue;
+          seen.push(configured);
+        }
+        updated.push(next);
       }
-      if (Array.isArray(updated.hooks)) {
-        updated.hooks = updated.hooks.filter((hook, i, all) => {
-          if (!hook.command?.includes("/apps/hook/crewpip-hook.mjs")) return true;
-          return !all.slice(0, i).some((other) => equal(other, hook));
-        });
-      }
-      // Ein bereits vorhandener, identischer neuer Hook läuft genau einmal.
-      if (
-        !equal(group, updated) &&
-        (groups.some((g) => equal(g, updated)) || result.some((g) => equal(g, updated)))
-      )
-        continue;
-      result.push(updated);
+      if (entries?.length === 0 || updated.length)
+        result.push(entries ? { ...context, hooks: updated } : updated[0]);
     }
     hooks[event] = result;
   }

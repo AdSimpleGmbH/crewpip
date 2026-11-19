@@ -465,3 +465,45 @@ test("Die persönliche Browser-Absenderwahl übernimmt nur der erste Besuch", as
   vm.runInNewContext(source, { localStorage });
   assert.equal(values.get("crewpip.humanName"), "new choice");
 });
+
+test("Identische CrewPip-Hooks in getrennten Gruppen desselben Matchers laufen einmal", (t) => {
+  const { home, command } = fixture(t);
+  const file = path.join(home, ".codex/hooks.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const newHook = {
+    type: "command",
+    command: "node " + path.resolve(path.dirname(service), "../apps/hook/crewpip-hook.mjs") + " codex stop",
+    timeout: 5,
+  };
+  const previous = { ...newHook, command: "node /previous/repo/apps/hook/" + legacyName + "-hook.mjs codex stop" };
+  const foreignA = { type: "command", command: "foreign-a" };
+  const foreignB = { type: "command", command: "foreign-b" };
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      hooks: {
+        Stop: [
+          { matcher: "A", hooks: [previous, foreignA] },
+          { matcher: "A", hooks: [newHook] },
+          { matcher: "B", hooks: [newHook] },
+          { matcher: "A", hooks: [foreignA, foreignB] },
+        ],
+      },
+    }),
+  );
+  const migrated = command();
+  assert.equal(migrated.status, 0, migrated.stderr);
+  const actual = JSON.parse(fs.readFileSync(file)).hooks.Stop;
+  assert.equal(
+    actual
+      .filter((g) => g.matcher === "A")
+      .flatMap((g) => g.hooks)
+      .filter((h) => h.command === newHook.command).length,
+    1,
+  );
+  assert.deepEqual(actual, [
+    { matcher: "A", hooks: [newHook, foreignA] },
+    { matcher: "B", hooks: [newHook] },
+    { matcher: "A", hooks: [foreignA, foreignB] },
+  ]);
+});
