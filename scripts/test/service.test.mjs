@@ -147,13 +147,21 @@ const runtimeCases = [
   { action: "migrate", upgrade: true, managed: true },
   { action: "migrate", upgrade: true, managed: false },
   { action: "migrate", upgrade: false, managed: true },
+  { action: "restart", upgrade: false, managed: true, sameCheckout: true, nodeFlags: ["--enable-source-maps"] },
+  { action: "restart", upgrade: false, managed: true, sameCheckout: true, nodeFlags: ["--trace-gc"] },
+  {
+    action: "install",
+    upgrade: true,
+    managed: true,
+    nodeFlags: ["--require", "node:util", "--conditions=fixture", "--enable-source-maps"],
+  },
   ...["install", "restart"].flatMap((action) =>
     [false, true].map((upgrade) => ({ action, upgrade, managed: true })),
   ),
 ];
 
-for (const { action, upgrade, managed } of runtimeCases) {
-  test(`Ersatzcheckout bei ${action}, ${upgrade ? "neuer" : "gleicher"} Node und ${managed ? "verwaltetem" : "individuellem"} PATH`, async (t) => {
+for (const { action, upgrade, managed, sameCheckout, nodeFlags = [] } of runtimeCases) {
+  test(`${nodeFlags.length ? "Node-Optionen " + nodeFlags[0] + ", " : ""}${sameCheckout ? "bestehender Checkout" : "Ersatzcheckout"} bei ${action}, ${upgrade ? "neuer" : "gleicher"} Node und ${managed ? "verwaltetem" : "individuellem"} PATH`, async (t) => {
     const { legacyName, oldLabel } = await import("../migration.mjs");
     const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crewpip-checkout-")));
     const pidFile = path.join(home, "fixture.pid");
@@ -165,7 +173,7 @@ for (const { action, upgrade, managed } of runtimeCases) {
       }
     });
     const checkout = path.join(home, "replacement");
-    const priorCheckout = path.join(home, "previous");
+    const priorCheckout = sameCheckout ? checkout : path.join(home, "previous");
     const daemon = "apps/daemon/dist/index.js";
     const args = action === "migrate" && upgrade ? [] : ["--example", "extra value"];
     const newBin = path.join(home, "v2/bin");
@@ -178,7 +186,7 @@ for (const { action, upgrade, managed } of runtimeCases) {
     const node = path.join(newBin, "node");
     fs.copyFileSync(process.execPath, node, fs.constants.COPYFILE_FICLONE);
     const runner = pathToFileURL(path.join(repo, "apps/daemon/src/runner/apps.ts")).href;
-    for (const root of [priorCheckout, checkout]) {
+    for (const root of new Set([priorCheckout, checkout])) {
       const entry = path.join(root, daemon);
       fs.mkdirSync(path.dirname(entry), { recursive: true });
       fs.writeFileSync(
@@ -186,7 +194,7 @@ for (const { action, upgrade, managed } of runtimeCases) {
         `
 const http = require("node:http");
 import(${JSON.stringify(runner)}).then(({ claudeApp }) => {
-  const report = { entry: __filename, cwd: process.cwd(), args: process.argv.slice(2), node: process.execPath, cli: claudeApp.bin(), setting: process.env.APP_SETTING, path: process.env.PATH };
+  const report = { entry: __filename, cwd: process.cwd(), args: process.argv.slice(2), nodeFlags: process.execArgv, node: process.execPath, cli: claudeApp.bin(), setting: process.env.APP_SETTING, path: process.env.PATH };
   http.createServer((req, res) => {
     res.writeHead(req.headers["x-crewpip-token"] === "fixture-only" ? 200 : 401, { "content-type": "application/json" });
     res.end(JSON.stringify(report));
@@ -248,7 +256,7 @@ pid.write_text(str(child.pid))
       execFileSync("plutil", ["-convert", "binary1", "-o", "-", "--", "-"], {
         input: JSON.stringify({
           Label: label,
-          ProgramArguments: [path.join(oldBin, "node"), path.join(priorCheckout, daemon), ...args],
+          ProgramArguments: [path.join(oldBin, "node"), ...nodeFlags, path.join(priorCheckout, daemon), ...args],
           WorkingDirectory: priorCheckout,
           EnvironmentVariables: {
             [(migration ? legacyName.toUpperCase() : "CREWPIP") + "_PORT"]: String(port),
@@ -258,7 +266,10 @@ pid.write_text(str(child.pid))
         }),
       }),
     );
+    const currentPlist = path.join(agents, "crewpip.plist");
+    const previousInode = sameCheckout ? fs.statSync(currentPlist).ino : null;
     await run(node, [path.join(checkout, "scripts/service.mjs"), action], { env, timeout: 20000 });
+    if (sameCheckout) assert.equal(fs.statSync(currentPlist).ino, previousInode, "Passende Plist wurde ersetzt");
     if (migration) {
       // Den übernommenen, zuvor gestoppten Dienst direkt laden. Ein zusätzliches
       // install oder restart würde einen Migrationsfehler in der Plist verdecken.
@@ -283,6 +294,7 @@ pid.write_text(str(child.pid))
       entry: path.join(checkout, daemon),
       cwd: checkout,
       args,
+      nodeFlags,
       node,
       cli: report.cli,
       setting: "retain",
@@ -290,3 +302,21 @@ pid.write_text(str(child.pid))
     });
   });
 }
+
+test("Node-Optionen dürfen einen fremden Einstieg oder den Optionswert eines Preloads nicht zum Daemon machen", async () => {
+  const { serviceRuntime, daemonEntry } = await import("../service-runtime.mjs");
+  const entry = daemonEntry("/previous");
+  const standalone = { ProgramArguments: [process.execPath, "--", entry, "trailing"] };
+  assert.deepEqual(serviceRuntime(repo, standalone).args, [process.execPath, "--", daemonEntry(repo), "trailing"]);
+  for (const args of [
+    [process.execPath, "/foreign.js", entry],
+    [process.execPath, "--require", entry, "/foreign.js"],
+    [process.execPath, "--require", entry],
+    [process.execPath, "--check", entry],
+    [process.execPath, "--unknown-option", entry],
+    ["/bin/sh", "--", entry],
+  ]) {
+    assert.throws(() => serviceRuntime(repo, { ProgramArguments: args }), /Startkonfiguration|Startskript/);
+  }
+  assert.throws(() => serviceRuntime(repo, standalone, { allowNodeOptions: false }), /Startskript/);
+});

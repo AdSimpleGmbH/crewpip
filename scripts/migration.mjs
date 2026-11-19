@@ -95,7 +95,7 @@ function getPlist(file) {
 function buildPlist(file, repo, old, current) {
   const doc = getPlist(file);
   if (doc.Label !== oldLabel) throw new Error("Die bisherige Dienst-Plist enthält eine fremde Kennung");
-  const runtime = serviceRuntime(repo, doc);
+  const runtime = serviceRuntime(repo, doc, { allowNodeOptions: false });
   doc.Label = label;
   doc.ProgramArguments = runtime.args;
   doc.WorkingDirectory = runtime.workingDirectory;
